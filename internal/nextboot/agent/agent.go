@@ -108,10 +108,20 @@ func Run(opts Options) error {
 	log("═══════════════════════════════════════════════════════════")
 	log("Talos installation complete.")
 
-	// ── 6. Reboot ────────────────────────────────────────────────────────────
+	// ── 6. Reboot into Talos ─────────────────────────────────────────────────
 	if opts.Reboot {
-		log("Rebooting into Talos Linux...")
+		log("Booting into Talos Linux...")
 		time.Sleep(2 * time.Second)
+
+		// kexec bypasses UEFI/BIOS entirely, which is critical on cloud VMs
+		// (e.g. EC2) where the firmware NVRAM still points to the old OS and
+		// the hypervisor does not reliably fall back to \EFI\BOOT\BOOTX64.EFI.
+		if err := kexecIntoTalos(opts.ImageURL); err != nil {
+			log("kexec not available or failed (%v); falling back to hardware reboot...", err)
+			return reboot()
+		}
+		// kexec executed — we should never reach here; fall through to reboot
+		// just in case (belt-and-suspenders).
 		return reboot()
 	}
 	log("AUTO_REBOOT disabled — run 'reboot' manually to boot into Talos.")
@@ -298,6 +308,113 @@ func writeConfig(disk string, config []byte) error {
 	}
 	return fmt.Errorf("could not mount STATE partition (tried: %s)",
 		strings.Join(candidates, ", "))
+}
+
+// ── kexec boot ───────────────────────────────────────────────────────────────
+
+// kexecIntoTalos downloads the Talos kernel and initramfs from the same image
+// factory URL, then uses kexec to boot into them directly.
+//
+// kexec bypasses the UEFI/BIOS boot sequence entirely.  This is the most
+// reliable approach on cloud VMs (AWS EC2, GCP, Azure) where the firmware
+// NVRAM still references the old OS after the disk is overwritten.
+//
+// When kexec succeeds this function does not return — the calling process is
+// killed when the kernel switches.  On failure it returns an error so the
+// caller can fall back to a hardware reboot.
+func kexecIntoTalos(imageURL string) error {
+	// Derive kernel + initramfs URLs from the raw image URL.
+	// Image:    .../metal-amd64.raw.zst  (or metal-arm64.raw.zst)
+	// Kernel:   .../kernel-amd64
+	// Initramfs:.../initramfs-amd64.xz
+	lastSlash := strings.LastIndex(imageURL, "/")
+	if lastSlash < 0 {
+		return fmt.Errorf("cannot parse image URL: %s", imageURL)
+	}
+	base := imageURL[:lastSlash]
+	filename := imageURL[lastSlash+1:]
+
+	var arch string
+	switch {
+	case strings.Contains(filename, "amd64"):
+		arch = "amd64"
+	case strings.Contains(filename, "arm64"):
+		arch = "arm64"
+	default:
+		return fmt.Errorf("cannot determine arch from image filename: %s", filename)
+	}
+
+	kernelURL := base + "/kernel-" + arch
+	initrdURL := base + "/initramfs-" + arch + ".xz"
+
+	// Ensure kexec-tools is installed.
+	if err := ensureTool("kexec"); err != nil {
+		return fmt.Errorf("installing kexec-tools: %w", err)
+	}
+
+	kernelPath := "/tmp/talos-kernel"
+	initrdPath := "/tmp/talos-initramfs.xz"
+
+	log("Downloading Talos kernel from %s ...", kernelURL)
+	if err := downloadFileTo(kernelURL, kernelPath); err != nil {
+		return fmt.Errorf("downloading kernel: %w", err)
+	}
+	if err := os.Chmod(kernelPath, 0755); err != nil {
+		return err
+	}
+
+	log("Downloading Talos initramfs from %s ...", initrdURL)
+	if err := downloadFileTo(initrdURL, initrdPath); err != nil {
+		return fmt.Errorf("downloading initramfs: %w", err)
+	}
+
+	// Standard Talos metal boot parameters (same as the GRUB template).
+	cmdLine := "console=tty0 console=ttyS0,9600 talos.platform=metal " +
+		"init_on_alloc=1 slab_nomerge pti=on panic=0 " +
+		"consoleblank=0 random.trust_cpu=on printk.devkmsg=on"
+
+	log("Loading kernel via kexec...")
+	if out, err := exec.Command("kexec",
+		"-l", kernelPath,
+		"--initrd="+initrdPath,
+		"--append="+cmdLine,
+	).CombinedOutput(); err != nil {
+		return fmt.Errorf("kexec -l: %w\n%s", err, string(out))
+	}
+
+	log("Executing kexec — switching to Talos kernel NOW...")
+	// This call replaces the running kernel; the process (and all others) are
+	// killed immediately.  If it returns, something went wrong.
+	out, err := exec.Command("kexec", "-e").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("kexec -e: %w\n%s", err, string(out))
+	}
+	return nil // unreachable on success
+}
+
+// downloadFileTo fetches url and writes it to destPath, overwriting any
+// existing file.
+func downloadFileTo(url, destPath string) error {
+	resp, err := http.Get(url) //nolint:noctx
+	if err != nil {
+		return fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s: server returned HTTP %d", url, resp.StatusCode)
+	}
+
+	f, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	buf := make([]byte, ioBlockSize)
+	if _, err := io.CopyBuffer(f, resp.Body, buf); err != nil {
+		return fmt.Errorf("writing %s: %w", destPath, err)
+	}
+	return nil
 }
 
 // ── UEFI boot entry management ───────────────────────────────────────────────
