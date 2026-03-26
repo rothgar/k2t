@@ -5,6 +5,9 @@ on:
     branches: ["main", "claude/**"]
   pull_request:
 
+env:
+  TALOS_VERSION: v1.12.6
+
 jobs:
   # ── Unit tests ──────────────────────────────────────────────────────────────
   unit:
@@ -140,7 +143,10 @@ jobs:
 
       - name: Install talosctl
         run: |
-          curl -sL https://talos.dev/install | sh
+          curl -fsSL \
+            "https://github.com/siderolabs/talos/releases/download/${{ env.TALOS_VERSION }}/talosctl-linux-amd64" \
+            -o /usr/local/bin/talosctl
+          chmod +x /usr/local/bin/talosctl
           talosctl version --client
 
       - name: Install k3s
