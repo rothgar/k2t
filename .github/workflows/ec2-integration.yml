@@ -143,6 +143,10 @@ jobs:
           aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0
 
+          # Port 6443: Kubernetes API server (used by collect's client-go resource export).
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 6443 --cidr 0.0.0.0/0
+
           echo "sg-id=$SG_ID" >> "$GITHUB_OUTPUT"
 
       # ── Launch EC2 instance ──────────────────────────────────────────────────
