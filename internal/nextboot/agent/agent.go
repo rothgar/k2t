@@ -80,16 +80,17 @@ func Run(opts Options) error {
 	}
 	log("Disk write complete.")
 
-	// ── 4. Update UEFI NVRAM so Talos is the next boot target ───────────────
-	// On UEFI systems the NVRAM still has the old OS's boot entry.  After the
-	// disk is overwritten that entry points to a file that no longer exists.
-	// UEFI will eventually fall back to \EFI\BOOT\BOOTX64.EFI (where Talos
-	// puts its bootloader), but some firmware implementations (including EC2's)
-	// can take 5+ minutes to try the fallback.  Using efibootmgr to set
-	// BootNext removes the delay and makes the next boot deterministic.
-	if err := updateUEFIBoot(disk); err != nil {
-		log("Warning: could not update UEFI boot entry: %v", err)
-		log("Talos will still boot via UEFI fallback (may take a few extra minutes).")
+	// ── 4. Patch the Talos EFI partition so hardware reboot works on EC2 ────
+	// EC2's UEFI NVRAM still has the old OS's boot entry (e.g. pointing to
+	// EFI/ubuntu/shimx64.efi).  On EC2 the NVRAM is not updated by in-OS
+	// efibootmgr calls — changes are only persisted on a stop/start cycle,
+	// not a soft reboot.  To make hardware reboot reliable we copy the Talos
+	// GRUB bootloader into the path the existing NVRAM entry references.
+	// This is belt-and-suspenders with kexec below, which boots without
+	// needing UEFI at all.
+	if err := copyTalosEFIToLegacyPaths(disk); err != nil {
+		log("Warning: could not patch Talos EFI partition: %v", err)
+		log("Hardware reboot may not work on this platform; kexec will be tried first.")
 	}
 
 	// ── 5. Write machine config to STATE partition ───────────────────────────
@@ -323,6 +324,16 @@ func writeConfig(disk string, config []byte) error {
 // killed when the kernel switches.  On failure it returns an error so the
 // caller can fall back to a hardware reboot.
 func kexecIntoTalos(imageURL string) error {
+	// Check for kernel lockdown — kexec_load is blocked when lockdown is
+	// active (e.g. with Secure Boot on Ubuntu).  Skip early to avoid
+	// downloading several hundred MB only to fail.
+	if data, err := os.ReadFile("/sys/kernel/security/lockdown"); err == nil {
+		mode := strings.TrimSpace(string(data))
+		if mode != "none" && mode != "" {
+			return fmt.Errorf("kernel lockdown is active (%q); kexec_load is not permitted", mode)
+		}
+	}
+
 	// Derive kernel + initramfs URLs from the raw image URL.
 	// Image:    .../metal-amd64.raw.zst  (or metal-arm64.raw.zst)
 	// Kernel:   .../kernel-amd64
@@ -368,10 +379,22 @@ func kexecIntoTalos(imageURL string) error {
 		return fmt.Errorf("downloading initramfs: %w", err)
 	}
 
-	// Standard Talos metal boot parameters (same as the GRUB template).
-	cmdLine := "console=tty0 console=ttyS0,9600 talos.platform=metal " +
-		"init_on_alloc=1 slab_nomerge pti=on panic=0 " +
-		"consoleblank=0 random.trust_cpu=on printk.devkmsg=on"
+	// Detect the cloud platform so Talos uses the right platform driver.
+	// On AWS EC2, talos.platform=aws enables IMDS-based network configuration
+	// and EC2-specific integrations.  On bare metal, use metal.
+	platform := detectTalosPlatform()
+	log("Detected Talos platform: %s", platform)
+
+	// Build kernel command line.
+	// net.ifnames=0  — use predictable eth0/eth1 naming (not ens5/enp0s3).
+	// console baud   — 115200 is standard for EC2 serial console.
+	cmdLine := fmt.Sprintf(
+		"console=tty0 console=ttyS0,115200 talos.platform=%s "+
+			"net.ifnames=0 init_on_alloc=1 slab_nomerge pti=on "+
+			"consoleblank=0 random.trust_cpu=on printk.devkmsg=on",
+		platform,
+	)
+	log("kexec cmdline: %s", cmdLine)
 
 	log("Loading kernel via kexec...")
 	if out, err := exec.Command("kexec",
@@ -390,6 +413,45 @@ func kexecIntoTalos(imageURL string) error {
 		return fmt.Errorf("kexec -e: %w\n%s", err, string(out))
 	}
 	return nil // unreachable on success
+}
+
+// detectTalosPlatform returns the Talos platform string for the current
+// environment.  It checks DMI data and cloud-specific metadata to distinguish
+// between AWS EC2, GCP, Azure, and bare metal.
+func detectTalosPlatform() string {
+	// AWS EC2: product_name in DMI is "HVM domU" or similar; also check uuid.
+	if data, err := os.ReadFile("/sys/class/dmi/id/product_name"); err == nil {
+		name := strings.TrimSpace(string(data))
+		if strings.Contains(strings.ToLower(name), "amazon") {
+			return "aws"
+		}
+	}
+	if data, err := os.ReadFile("/sys/class/dmi/id/sys_vendor"); err == nil {
+		vendor := strings.TrimSpace(string(data))
+		if strings.Contains(strings.ToLower(vendor), "amazon") {
+			return "aws"
+		}
+	}
+	// EC2 instance identity is also available via the hypervisor UUID.
+	if data, err := os.ReadFile("/sys/hypervisor/uuid"); err == nil {
+		uuid := strings.ToLower(strings.TrimSpace(string(data)))
+		if strings.HasPrefix(uuid, "ec2") {
+			return "aws"
+		}
+	}
+	// GCP: check board vendor or asset tag.
+	if data, err := os.ReadFile("/sys/class/dmi/id/board_vendor"); err == nil {
+		if strings.Contains(strings.ToLower(string(data)), "google") {
+			return "gcp"
+		}
+	}
+	// Azure: check chassis asset tag.
+	if data, err := os.ReadFile("/sys/class/dmi/id/chassis_asset_tag"); err == nil {
+		if strings.Contains(string(data), "7783-7084-3265-9085-8269-3286-77") {
+			return "azure"
+		}
+	}
+	return "metal"
 }
 
 // downloadFileTo fetches url and writes it to destPath, overwriting any
@@ -417,7 +479,97 @@ func downloadFileTo(url, destPath string) error {
 	return nil
 }
 
-// ── UEFI boot entry management ───────────────────────────────────────────────
+// ── UEFI boot path patching ───────────────────────────────────────────────────
+
+// copyTalosEFIToLegacyPaths copies the Talos GRUB bootloader binary into the
+// paths that the existing UEFI NVRAM entries typically point to (e.g.
+// EFI/ubuntu/shimx64.efi).  This makes a plain hardware reboot reliable on
+// cloud VMs (AWS EC2, GCP, Azure) where the NVRAM cannot be updated from
+// inside the running OS.
+//
+// On EC2 specifically, NVRAM changes via efibootmgr are NOT persisted across
+// soft reboots — the hypervisor restores NVRAM from an S3 snapshot taken at
+// OS-start time, so any in-OS efibootmgr changes are lost on the next reboot.
+// Placing the Talos GRUB binary at the expected Ubuntu path sidesteps this.
+func copyTalosEFIToLegacyPaths(disk string) error {
+	if _, err := os.Stat("/sys/firmware/efi/efivars"); err != nil {
+		log("BIOS system — skipping EFI path patch.")
+		return nil
+	}
+
+	// Determine the EFI partition device (partition 1).
+	var efiPart string
+	if strings.Contains(disk, "nvme") || strings.Contains(disk, "mmcblk") {
+		efiPart = disk + "p1"
+	} else {
+		efiPart = disk + "1"
+	}
+
+	if _, err := os.Stat(efiPart); err != nil {
+		return fmt.Errorf("EFI partition %s not found: %w", efiPart, err)
+	}
+
+	mountPoint, err := os.MkdirTemp("", "talos-efi-*")
+	if err != nil {
+		return fmt.Errorf("creating mount point: %w", err)
+	}
+	defer os.RemoveAll(mountPoint)
+
+	if err := exec.Command("mount", efiPart, mountPoint).Run(); err != nil {
+		return fmt.Errorf("mounting EFI partition %s: %w", efiPart, err)
+	}
+	defer exec.Command("umount", mountPoint).Run() //nolint:errcheck
+
+	// Find the Talos GRUB binary.  Try the fallback path first, then the
+	// Talos-specific path.  Paths on FAT are case-insensitive but we try
+	// common casings.
+	var efiData []byte
+	srcCandidates := []string{
+		filepath.Join(mountPoint, "EFI", "BOOT", "BOOTX64.EFI"),
+		filepath.Join(mountPoint, "EFI", "talos", "grubx64.efi"),
+		filepath.Join(mountPoint, "efi", "boot", "bootx64.efi"),
+	}
+	for _, src := range srcCandidates {
+		if data, err := os.ReadFile(src); err == nil {
+			efiData = data
+			log("Found Talos EFI binary at %s (%d bytes)", src, len(data))
+			break
+		}
+	}
+	if efiData == nil {
+		return fmt.Errorf("Talos EFI binary not found in partition (tried: %v)", srcCandidates)
+	}
+
+	// Create the ubuntu EFI directory and copy the Talos binary there.
+	// EC2's NVRAM entry for Ubuntu typically references shimx64.efi.
+	ubuntuDir := filepath.Join(mountPoint, "EFI", "ubuntu")
+	if err := os.MkdirAll(ubuntuDir, 0755); err != nil {
+		return fmt.Errorf("creating EFI/ubuntu: %w", err)
+	}
+
+	// Copy to all common Ubuntu EFI paths so any NVRAM variant is covered.
+	destinations := []string{
+		filepath.Join(ubuntuDir, "shimx64.efi"),
+		filepath.Join(ubuntuDir, "grubx64.efi"),
+		filepath.Join(ubuntuDir, "grub.efi"),
+	}
+	copied := 0
+	for _, dst := range destinations {
+		if err := os.WriteFile(dst, efiData, 0755); err != nil {
+			log("Warning: could not write %s: %v", filepath.Base(dst), err)
+		} else {
+			log("Copied Talos EFI bootloader → %s", strings.TrimPrefix(dst, mountPoint))
+			copied++
+		}
+	}
+	if copied == 0 {
+		return fmt.Errorf("could not write any EFI files to EFI/ubuntu/")
+	}
+
+	exec.Command("sync").Run() //nolint:errcheck
+	log("EFI partition patched — hardware reboot will boot Talos via legacy NVRAM entry.")
+	return nil
+}
 
 // updateUEFIBoot uses efibootmgr to add a Talos boot entry and set it as
 // BootNext so the machine boots directly into Talos on the next restart,
