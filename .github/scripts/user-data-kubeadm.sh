@@ -1,7 +1,14 @@
 #!/bin/bash
 # cloud-init user-data: install kubeadm and initialise a single-node cluster.
-# Root SSH is set up by the workflow after the instance is reachable.
 set -euo pipefail
+
+# Set up SSH key for the ubuntu user immediately so the runner can connect
+# while the rest of the installation proceeds.
+mkdir -p /home/ubuntu/.ssh
+echo "__SSH_PUBLIC_KEY__" >> /home/ubuntu/.ssh/authorized_keys
+chmod 700 /home/ubuntu/.ssh
+chmod 600 /home/ubuntu/.ssh/authorized_keys
+chown -R ubuntu:ubuntu /home/ubuntu/.ssh
 
 export DEBIAN_FRONTEND=noninteractive
 
