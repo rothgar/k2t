@@ -15,7 +15,7 @@ apt-get update -q
 apt-get install -y -q curl
 
 curl -sfL https://get.k3s.io | \
-  INSTALL_K3S_EXEC="--disable=traefik --disable=servicelb --write-kubeconfig-mode=644" \
+  INSTALL_K3S_EXEC="--disable=traefik --disable=servicelb --write-kubeconfig-mode=644 --cluster-init" \
   sh -
 
 # Wait for k3s to be ready (up to 3 minutes).
