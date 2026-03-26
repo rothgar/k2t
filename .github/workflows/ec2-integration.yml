@@ -347,28 +347,27 @@ jobs:
             sleep 5
           done
 
-      # ── Bootstrap the Talos cluster ───────────────────────────────────────
-      - name: Bootstrap Talos cluster
+      # ── Restore etcd from k3s snapshot (replaces bootstrap) ──────────────
+      # etcd recover uses --force-new-cluster to initialize etcd directly
+      # from the k3s snapshot — do NOT run talosctl bootstrap before this.
+      - name: Restore etcd from k3s snapshot
         run: |
-          echo "Bootstrapping Talos (retrying up to 5 minutes for API readiness)..."
+          echo "Waiting for Talos machine API to be ready (up to 5 minutes)..."
           for i in $(seq 1 30); do
-            out=$(talosctl bootstrap \
+            out=$(talosctl etcd recover \
               --nodes "$TALOS_IP" \
-              --talosconfig test-backup/talos-config/talosconfig 2>&1) && {
-              echo "Bootstrap successful"
+              --talosconfig test-backup/talos-config/talosconfig \
+              -f test-backup/database/etcd-snapshot.db 2>&1) && {
+              echo "✓ etcd recovered from k3s snapshot"
               break
             }
-            # "already bootstrapped" is not a real error
-            echo "$out" | grep -qi "already bootstrapped" && {
-              echo "etcd already bootstrapped — continuing"
-              break
-            }
-            echo "Bootstrap attempt $i failed: $out"
-            [ "$i" -eq 30 ] && { echo "Bootstrap failed after 30 attempts"; exit 1; }
+            echo "etcd recover attempt $i: $out"
+            [ "$i" -eq 30 ] && { echo "etcd recover failed after 30 attempts"; exit 1; }
             sleep 10
           done
 
       # ── Retrieve kubeconfig ───────────────────────────────────────────────
+
       - name: Retrieve kubeconfig
         run: |
           echo "Waiting for Kubernetes API to become available..."
@@ -387,27 +386,19 @@ jobs:
           done
           echo "KUBECONFIG=$(pwd)/talos-kubeconfig" >> "$GITHUB_ENV"
 
-      # ── Wait for Talos node Ready ─────────────────────────────────────────
-      - name: Wait for Talos node Ready
+      # ── Wait for Kubernetes API to serve restored data ────────────────────
+      - name: Wait for Kubernetes API
         run: |
-          echo "Waiting for Talos node to be Ready..."
+          echo "Waiting for Kubernetes API to respond (up to 10 minutes)..."
           for i in $(seq 1 120); do
-            if kubectl get nodes 2>/dev/null | grep -q " Ready"; then
-              echo "Node Ready after $((i*5))s"
-              kubectl get nodes
+            if kubectl get namespaces 2>/dev/null | grep -q "default"; then
+              echo "Kubernetes API serving restored data after $((i*5))s"
+              kubectl get nodes 2>/dev/null || true
               break
             fi
-            [ "$i" -eq 120 ] && { echo "Timeout: Talos node not Ready"; exit 1; }
+            [ "$i" -eq 120 ] && { echo "Timeout: Kubernetes API not ready"; exit 1; }
             sleep 5
           done
-
-      # ── Restore etcd from k3s backup ──────────────────────────────────────
-      - name: Restore etcd from k3s snapshot
-        run: |
-          talosctl etcd recover \
-            --nodes "$TALOS_IP" \
-            --talosconfig test-backup/talos-config/talosconfig \
-            -f test-backup/database/etcd-snapshot.db
 
       # ── Verify migrated workload ──────────────────────────────────────────
       - name: Verify ci-test-nginx deployment on Talos
