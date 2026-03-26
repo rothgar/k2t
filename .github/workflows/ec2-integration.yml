@@ -214,33 +214,7 @@ jobs:
             kubeadm) KUBECTL="sudo kubectl" ;;
           esac
 
-          cat <<'MANIFEST' | $SSH "$KUBECTL apply -f -"
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: ci-test-nginx
-            namespace: default
-            labels:
-              app: ci-test-nginx
-              source: k3s-to-talos-ci
-          spec:
-            replicas: 1
-            selector:
-              matchLabels:
-                app: ci-test-nginx
-            template:
-              metadata:
-                labels:
-                  app: ci-test-nginx
-              spec:
-                containers:
-                - name: nginx
-                  image: nginx:alpine
-                  ports:
-                  - containerPort: 80
-          MANIFEST
-
-          # Wait for rollout (up to 2 min).
+          $SSH "$KUBECTL create deployment ci-test-nginx --image=nginx:alpine --replicas=1"
           $SSH "$KUBECTL rollout status deployment/ci-test-nginx --timeout=120s"
           echo "Test workload ready."
 
