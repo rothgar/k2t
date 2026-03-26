@@ -313,13 +313,18 @@ jobs:
       # ── Wait for Talos maintenance API ────────────────────────────────────
       - name: Wait for Talos maintenance API
         run: |
-          echo "Waiting for Talos API on $TALOS_IP:50000..."
-          for i in $(seq 1 60); do
-            if talosctl version --insecure --nodes "$TALOS_IP" 2>/dev/null; then
-              echo "Talos maintenance API ready after $((i*5))s"
-              break
+          echo "Waiting for Talos maintenance API on $TALOS_IP:50000 (up to 10 minutes)..."
+          for i in $(seq 1 120); do
+            if nc -zw5 "$TALOS_IP" 50000 2>/dev/null; then
+              echo "Port 50000 open after $((i*5))s — trying talosctl..."
+              if talosctl --talosconfig /dev/null disks \
+                   --insecure --nodes "$TALOS_IP" 2>/dev/null; then
+                echo "Talos maintenance API ready after $((i*5))s"
+                break
+              fi
+              # Port is open but API not responding yet — keep waiting
             fi
-            [ "$i" -eq 60 ] && { echo "Timeout: Talos maintenance API unreachable"; exit 1; }
+            [ "$i" -eq 120 ] && { echo "Timeout: Talos maintenance API unreachable after 10 minutes"; exit 1; }
             sleep 5
           done
 
@@ -330,12 +335,26 @@ jobs:
             --insecure \
             --nodes "$TALOS_IP" \
             --file test-backup/talos-config/controlplane.yaml
+          echo "Config applied — Talos will reboot now"
+
+      # ── Wait for Talos API after config-apply reboot ──────────────────────
+      - name: Wait for Talos API after reboot
+        run: |
+          echo "Waiting for Talos API to return after config-apply reboot (up to 5 minutes)..."
+          sleep 15
+          for i in $(seq 1 60); do
+            if talosctl --talosconfig test-backup/talos-config/talosconfig \
+                 --nodes "$TALOS_IP" version 2>/dev/null; then
+              echo "Talos API ready after reboot ($((i*5 + 15))s)"
+              break
+            fi
+            [ "$i" -eq 60 ] && { echo "Timeout: Talos API not ready after reboot"; exit 1; }
+            sleep 5
+          done
 
       # ── Bootstrap the Talos cluster ───────────────────────────────────────
       - name: Bootstrap Talos cluster
         run: |
-          # Give Talos time to process the machine config before bootstrap
-          sleep 15
           talosctl bootstrap \
             --nodes "$TALOS_IP" \
             --talosconfig test-backup/talos-config/talosconfig
