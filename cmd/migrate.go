@@ -19,6 +19,7 @@ var (
 	flagClusterName  string
 	flagDryRun       bool
 	flagResume       bool
+	flagYes          bool
 )
 
 var migrateCmd = &cobra.Command{
@@ -42,6 +43,7 @@ func init() {
 	migrateCmd.Flags().StringVar(&flagClusterName, "cluster-name", "", "Name for the Talos cluster (defaults to the k3s cluster name or 'talos-cluster')")
 	migrateCmd.Flags().BoolVar(&flagDryRun, "dry-run", false, "Collect info and show what would happen, but do not modify the remote machine")
 	migrateCmd.Flags().BoolVar(&flagResume, "resume", false, "Resume a previously interrupted migration from the last completed phase")
+	migrateCmd.Flags().BoolVar(&flagYes, "yes", false, "Skip the interactive confirmation prompt (for CI/automation)")
 }
 
 func runMigrate(cmd *cobra.Command, args []string) error {
@@ -117,10 +119,12 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 
 	ui.PrintIrreversibilityWarning(flagHost)
 
-	if !flagDryRun {
+	if !flagDryRun && !flagYes {
 		if err := ui.ConfirmErase(flagHost); err != nil {
 			return err
 		}
+	} else if flagYes {
+		color.Yellow("[--yes] Skipping confirmation prompt.\n")
 	} else {
 		color.Yellow("[DRY RUN] Skipping confirmation prompt.\n")
 	}
@@ -212,12 +216,19 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		controlPlaneCfg := filepath.Join(state.TalosConfigDir, "controlplane.yaml")
 		kubeconfigOut := filepath.Join(flagBackupDir, "talos-kubeconfig")
 
+		// Use etcd recover (from k3s snapshot) instead of bootstrap when available.
+		snapshotPath := filepath.Join(flagBackupDir, "database", "etcd-snapshot.db")
+		if _, err := os.Stat(snapshotPath); err != nil {
+			snapshotPath = "" // no snapshot — fall back to standard bootstrap
+		}
+
 		bootstrapper := talos.NewBootstrapper(flagBackupDir)
 		if err := bootstrapper.Bootstrap(talos.BootstrapOptions{
-			Host:            flagHost,
-			TalosConfigFile: talosConfigFile,
-			ControlPlaneCfg: controlPlaneCfg,
-			KubeconfigOut:   kubeconfigOut,
+			Host:             flagHost,
+			TalosConfigFile:  talosConfigFile,
+			ControlPlaneCfg:  controlPlaneCfg,
+			KubeconfigOut:    kubeconfigOut,
+			EtcdSnapshotPath: snapshotPath,
 		}); err != nil {
 			return fmt.Errorf("bootstrapping Talos cluster: %w", err)
 		}

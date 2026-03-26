@@ -58,6 +58,9 @@ jobs:
           echo "Resolved ubuntu-24.04 AMI: $u24"
 
   # ── End-to-end k3s → Talos migration test ─────────────────────────────────────
+  # Flow: Ubuntu k3s instance → nextboot-talos.py converts OS in-place →
+  #       same instance reboots into Talos → etcd restore from k3s snapshot →
+  #       verify workload survived migration
   ec2-test:
     name: k3s → Talos migration
     needs: [build, resolve-amis]
@@ -79,7 +82,7 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # ── Install talosctl ───────────────────────────────────────────────────
+      # ── Install talosctl (used by the migrate command's bootstrap phase) ───
       - name: Install talosctl
         run: |
           curl -fsSL \
@@ -99,34 +102,38 @@ jobs:
         run: |
           sed "s|__SSH_PUBLIC_KEY__|${SSH_PUB_KEY}|g" \
             .github/scripts/user-data-k3s.sh > /tmp/user-data-k3s.sh
-          cat /tmp/user-data-k3s.sh
 
-      # ── Create security group for k3s instance ────────────────────────────
-      - name: Create k3s security group
-        id: k3s-sg
+      # ── Create security group (SSH + Talos API + Kubernetes API) ──────────
+      # Same instance transitions from k3s → Talos, so the SG needs ports
+      # for both: 22 (SSH for k3s phase), 50000 (Talos API), 6443 (kube API).
+      - name: Create security group
+        id: sg
         run: |
           SG_ID=$(aws ec2 create-security-group \
-            --group-name "k3s-to-talos-ci-${{ github.run_id }}-k3s" \
-            --description "CI k3s SG for run ${{ github.run_id }}" \
+            --group-name "k3s-to-talos-ci-${{ github.run_id }}" \
+            --description "CI migration SG for run ${{ github.run_id }}" \
             --vpc-id "${{ secrets.AWS_VPC_ID }}" \
             --query 'GroupId' --output text)
 
           aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0
           aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 50000 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" --protocol tcp --port 6443 --cidr 0.0.0.0/0
 
           echo "sg-id=$SG_ID" >> "$GITHUB_OUTPUT"
+          echo "Created SG: $SG_ID"
 
-      # ── Launch k3s EC2 instance ───────────────────────────────────────────
+      # ── Launch single EC2 instance (Ubuntu / k3s) ─────────────────────────
       - name: Launch k3s instance
-        id: k3s-ec2
+        id: ec2
         run: |
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id "${{ needs.resolve-amis.outputs.ubuntu-2404 }}" \
             --instance-type "${{ env.INSTANCE_TYPE }}" \
             --subnet-id "${{ secrets.AWS_SUBNET_ID }}" \
-            --security-group-ids "${{ steps.k3s-sg.outputs.sg-id }}" \
+            --security-group-ids "${{ steps.sg.outputs.sg-id }}" \
             --user-data file:///tmp/user-data-k3s.sh \
             --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":20,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
             --tag-specifications \
@@ -135,30 +142,30 @@ jobs:
             --query 'Instances[0].InstanceId' --output text)
 
           echo "instance-id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
-          echo "Launched k3s instance: $INSTANCE_ID"
+          echo "Launched instance: $INSTANCE_ID"
 
-      - name: Wait for k3s instance running
+      - name: Wait for instance running
         run: |
           aws ec2 wait instance-running \
-            --instance-ids "${{ steps.k3s-ec2.outputs.instance-id }}"
+            --instance-ids "${{ steps.ec2.outputs.instance-id }}"
 
-          K3S_IP=$(aws ec2 describe-instances \
-            --instance-ids "${{ steps.k3s-ec2.outputs.instance-id }}" \
+          IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2.outputs.instance-id }}" \
             --query 'Reservations[0].Instances[0].PublicIpAddress' \
             --output text)
 
-          echo "K3S_IP=$K3S_IP" >> "$GITHUB_ENV"
-          echo "k3s instance IP: $K3S_IP"
+          echo "NODE_IP=$IP" >> "$GITHUB_ENV"
+          echo "Instance IP: $IP"
 
-      - name: Wait for SSH to become available
+      - name: Wait for SSH
         run: |
-          echo "Waiting for SSH on $K3S_IP..."
+          echo "Waiting for SSH on $NODE_IP..."
           for i in $(seq 1 40); do
             if ssh -i "$HOME/.ssh/ci_key" \
                    -o StrictHostKeyChecking=no \
                    -o UserKnownHostsFile=/dev/null \
                    -o ConnectTimeout=5 \
-                   "ubuntu@$K3S_IP" "exit 0" 2>/dev/null; then
+                   "ubuntu@$NODE_IP" "exit 0" 2>/dev/null; then
               echo "SSH ready after $((i*5))s"
               break
             fi
@@ -168,8 +175,7 @@ jobs:
 
       - name: Wait for k3s cluster to be ready
         run: |
-          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$K3S_IP"
-
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$NODE_IP"
           echo "Waiting for k3s cluster to become ready (up to 15 minutes)..."
           for i in $(seq 1 180); do
             if $SSH "sudo k3s kubectl get nodes 2>/dev/null" | grep -q " Ready"; then
@@ -180,240 +186,48 @@ jobs:
             sleep 5
           done
 
-      # ── Deploy test workload ──────────────────────────────────────────────
+      # ── Deploy test workload that should survive the migration ────────────
       - name: Deploy test workload on k3s
         run: |
-          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$K3S_IP"
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$NODE_IP"
           $SSH "sudo k3s kubectl create deployment ci-test-nginx --image=nginx:alpine --replicas=1"
           $SSH "sudo k3s kubectl get deployment ci-test-nginx"
 
-      # ── Verify etcd is running and snapshots dir exists ──────────────────
-      - name: Check k3s etcd state
+      # ── Run the full migration (collect → nextboot → bootstrap) ───────────
+      # --yes skips the interactive confirmation prompt
+      # The migrate command:
+      #   1. Backs up k3s etcd snapshot + resources
+      #   2. Generates Talos machine config
+      #   3. Runs nextboot-talos.py — rewrites disk with Talos image, reboots
+      #   4. Waits for Talos, applies config, restores etcd from snapshot,
+      #      retrieves kubeconfig
+      - name: Run k3s-to-talos migrate
         run: |
-          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$K3S_IP"
-          echo "=== k3s etcd member dir ==="
-          $SSH "sudo ls -la /var/lib/rancher/k3s/server/db/etcd/member 2>/dev/null || echo 'member dir not found'"
-          echo "=== k3s snapshots dir ==="
-          $SSH "sudo ls -la /var/lib/rancher/k3s/server/db/snapshots/ 2>/dev/null || echo 'snapshots dir not found'"
-          echo "=== k3s etcd-snapshot list ==="
-          $SSH "sudo k3s etcd-snapshot list 2>&1" || true
-
-      # ── Collect k3s backup ────────────────────────────────────────────────
-      - name: Run collect
-        run: |
-          ./k3s-to-talos collect \
-            --host "$K3S_IP" \
+          ./k3s-to-talos migrate \
+            --host "$NODE_IP" \
             --ssh-user ubuntu \
             --ssh-key "$HOME/.ssh/ci_key" \
             --sudo \
-            --backup-dir ./test-backup
-
-      # ── Assert backup contents ────────────────────────────────────────────
-      - name: Assert backup artefacts
-        run: |
-          echo "=== Backup contents ==="
-          find test-backup -type f | sort
-
-          echo "=== Assertions ==="
-          test -f test-backup/k3s.yaml \
-            && echo "✓ kubeconfig" \
-            || { echo "✗ kubeconfig missing"; exit 1; }
-
-          test -f test-backup/database/etcd-snapshot.db \
-            && echo "✓ etcd snapshot" \
-            || { echo "✗ etcd snapshot missing (k3s running without --cluster-init?)"; exit 1; }
-
-          resource_count=$(find test-backup/resources -name "*.yaml" 2>/dev/null | wc -l)
-          echo "  Exported resource files: $resource_count"
-          test "$resource_count" -gt 0 && echo "✓ resources exported"
-
-          test -f "test-backup/resources/deployments/default__ci-test-nginx.yaml" \
-            && echo "✓ test workload in backup" \
-            || { echo "✗ test workload missing from backup"; exit 1; }
-
-      # ── k3s instance is no longer needed — terminate early ────────────────
-      - name: Terminate k3s instance
-        if: always()
-        run: |
-          aws ec2 terminate-instances \
-            --instance-ids "${{ steps.k3s-ec2.outputs.instance-id }}" 2>/dev/null || true
-
-      # ══════════════════════════════════════════════════════════════════════
-      # Phase 2: Talos migration
-      # ══════════════════════════════════════════════════════════════════════
-
-      # ── Resolve Talos AMI ─────────────────────────────────────────────────
-      - name: Resolve Talos AMI for us-west-2
-        run: |
-          TALOS_AMI=$(curl -fsSL \
-            "https://github.com/siderolabs/talos/releases/download/${{ env.TALOS_VERSION }}/cloud-images.json" \
-            | jq -r '.[] | select(.region == "us-west-2" and .arch == "amd64") | .id' \
-            | head -1)
-          echo "TALOS_AMI=$TALOS_AMI" >> "$GITHUB_ENV"
-          echo "Talos AMI: $TALOS_AMI"
-          [ -n "$TALOS_AMI" ] || { echo "No Talos AMI found for us-west-2/amd64"; exit 1; }
-
-      # ── Create security group for Talos instance ──────────────────────────
-      - name: Create Talos security group
-        id: talos-sg
-        run: |
-          SG_ID=$(aws ec2 create-security-group \
-            --group-name "k3s-to-talos-ci-${{ github.run_id }}-talos" \
-            --description "CI Talos SG for run ${{ github.run_id }}" \
-            --vpc-id "${{ secrets.AWS_VPC_ID }}" \
-            --query 'GroupId' --output text)
-
-          # talosctl API
-          aws ec2 authorize-security-group-ingress \
-            --group-id "$SG_ID" --protocol tcp --port 50000 --cidr 0.0.0.0/0
-          # Kubernetes API (for kubeconfig retrieval and kubectl)
-          aws ec2 authorize-security-group-ingress \
-            --group-id "$SG_ID" --protocol tcp --port 6443 --cidr 0.0.0.0/0
-
-          echo "sg-id=$SG_ID" >> "$GITHUB_OUTPUT"
-
-      # ── Launch Talos EC2 instance ─────────────────────────────────────────
-      - name: Launch Talos instance
-        id: talos-ec2
-        run: |
-          INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id "$TALOS_AMI" \
-            --instance-type "${{ env.INSTANCE_TYPE }}" \
-            --subnet-id "${{ secrets.AWS_SUBNET_ID }}" \
-            --security-group-ids "${{ steps.talos-sg.outputs.sg-id }}" \
-            --tag-specifications \
-              "ResourceType=instance,Tags=[{Key=Name,Value=k3s-to-talos-ci-talos},{Key=GHRunId,Value=${{ github.run_id }}}]" \
-            --query 'Instances[0].InstanceId' --output text)
-
-          echo "instance-id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
-          echo "Launched Talos instance: $INSTANCE_ID"
-
-      - name: Wait for Talos instance running
-        run: |
-          aws ec2 wait instance-running \
-            --instance-ids "${{ steps.talos-ec2.outputs.instance-id }}"
-
-          TALOS_IP=$(aws ec2 describe-instances \
-            --instance-ids "${{ steps.talos-ec2.outputs.instance-id }}" \
-            --query 'Reservations[0].Instances[0].PublicIpAddress' \
-            --output text)
-
-          echo "TALOS_IP=$TALOS_IP" >> "$GITHUB_ENV"
-          echo "Talos instance IP: $TALOS_IP"
-
-      # ── Generate Talos machine config ─────────────────────────────────────
-      - name: Generate Talos machine config
-        run: |
-          ./k3s-to-talos generate \
-            --cluster-endpoint "$TALOS_IP" \
-            --cluster-name "talos-migration-test" \
             --talos-version "${{ env.TALOS_VERSION }}" \
+            --cluster-name "ci-migration-test" \
+            --yes \
             --backup-dir ./test-backup
 
-      # ── Wait for Talos maintenance API ────────────────────────────────────
-      - name: Wait for Talos maintenance API
-        run: |
-          echo "Talos instance IP: $TALOS_IP"
-          echo "Waiting for port 50000 on $TALOS_IP (up to 10 minutes)..."
-          for i in $(seq 1 120); do
-            if nc -zw5 "$TALOS_IP" 50000 2>/dev/null; then
-              echo "Talos maintenance API port open after $((i*5))s"
-              break
-            fi
-            [ "$i" -eq 120 ] && { echo "Timeout: port 50000 unreachable after 10 minutes"; exit 1; }
-            sleep 5
-          done
-
-      # ── Apply machine config ──────────────────────────────────────────────
-      - name: Apply Talos machine config
-        run: |
-          talosctl apply-config \
-            --insecure \
-            --nodes "$TALOS_IP" \
-            --file test-backup/talos-config/controlplane.yaml
-          echo "Config applied — Talos will reboot now"
-
-      # ── Wait for Talos API after config-apply reboot ──────────────────────
-      - name: Wait for Talos API after reboot
-        run: |
-          echo "Waiting for Talos to come back up on $TALOS_IP:50000 (up to 10 minutes)..."
-          sleep 30
-          for i in $(seq 1 120); do
-            if nc -zw5 "$TALOS_IP" 50000 2>/dev/null; then
-              echo "Talos API port open after reboot ($((i*5 + 30))s)"
-              break
-            fi
-            [ "$i" -eq 120 ] && { echo "Timeout: Talos not back up after 10 minutes"; exit 1; }
-            sleep 5
-          done
-
-      # ── Restore etcd from k3s snapshot (replaces bootstrap) ──────────────
-      # etcd recover uses --force-new-cluster to initialize etcd directly
-      # from the k3s snapshot — do NOT run talosctl bootstrap before this.
-      - name: Restore etcd from k3s snapshot
-        run: |
-          echo "Waiting for Talos machine API to be ready (up to 5 minutes)..."
-          for i in $(seq 1 30); do
-            out=$(talosctl etcd recover \
-              --nodes "$TALOS_IP" \
-              --talosconfig test-backup/talos-config/talosconfig \
-              -f test-backup/database/etcd-snapshot.db 2>&1) && {
-              echo "✓ etcd recovered from k3s snapshot"
-              break
-            }
-            echo "etcd recover attempt $i: $out"
-            [ "$i" -eq 30 ] && { echo "etcd recover failed after 30 attempts"; exit 1; }
-            sleep 10
-          done
-
-      # ── Retrieve kubeconfig ───────────────────────────────────────────────
-
-      - name: Retrieve kubeconfig
-        run: |
-          echo "Waiting for Kubernetes API to become available..."
-          for i in $(seq 1 120); do
-            if talosctl kubeconfig \
-                  --nodes "$TALOS_IP" \
-                  --talosconfig test-backup/talos-config/talosconfig \
-                  --force \
-                  --merge=false \
-                  ./talos-kubeconfig 2>/dev/null; then
-              echo "Kubeconfig retrieved after $((i*5))s"
-              break
-            fi
-            [ "$i" -eq 120 ] && { echo "Timeout: could not retrieve kubeconfig"; exit 1; }
-            sleep 5
-          done
-          echo "KUBECONFIG=$(pwd)/talos-kubeconfig" >> "$GITHUB_ENV"
-
-      # ── Wait for Kubernetes API to serve restored data ────────────────────
-      - name: Wait for Kubernetes API
-        run: |
-          echo "Waiting for Kubernetes API to respond (up to 10 minutes)..."
-          for i in $(seq 1 120); do
-            if kubectl get namespaces 2>/dev/null | grep -q "default"; then
-              echo "Kubernetes API serving restored data after $((i*5))s"
-              kubectl get nodes 2>/dev/null || true
-              break
-            fi
-            [ "$i" -eq 120 ] && { echo "Timeout: Kubernetes API not ready"; exit 1; }
-            sleep 5
-          done
-
-      # ── Verify migrated workload ──────────────────────────────────────────
+      # ── Verify workload survived the migration ────────────────────────────
       - name: Verify ci-test-nginx deployment on Talos
         run: |
-          echo "Waiting for ci-test-nginx deployment to appear after etcd restore..."
+          export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
+          echo "Waiting for ci-test-nginx deployment to be present after etcd restore..."
           for i in $(seq 1 60); do
             if kubectl get deployment ci-test-nginx --namespace default 2>/dev/null; then
               echo "✓ ci-test-nginx deployment present on Talos after migration"
               break
             fi
-            [ "$i" -eq 60 ] && { echo "✗ ci-test-nginx not found after etcd restore"; exit 1; }
+            [ "$i" -eq 60 ] && { echo "✗ ci-test-nginx not found after migration"; exit 1; }
             sleep 5
           done
 
-      # ── Upload artefacts ──────────────────────────────────────────────────
+      # ── Upload backup artefacts for debugging ─────────────────────────────
       - name: Upload backup artefact
         if: always()
         uses: actions/upload-artifact@v4
@@ -423,24 +237,20 @@ jobs:
           retention-days: 3
 
       # ── Cleanup ───────────────────────────────────────────────────────────
-      - name: Terminate Talos instance
+      - name: Terminate instance
         if: always()
         run: |
-          if [ -n "${{ steps.talos-ec2.outputs.instance-id }}" ]; then
-            aws ec2 terminate-instances \
-              --instance-ids "${{ steps.talos-ec2.outputs.instance-id }}" 2>/dev/null || true
-          fi
+          aws ec2 terminate-instances \
+            --instance-ids "${{ steps.ec2.outputs.instance-id }}" 2>/dev/null || true
 
-      - name: Delete security groups
+      - name: Delete security group
         if: always()
         run: |
-          for SG in "${{ steps.k3s-sg.outputs.sg-id }}" "${{ steps.talos-sg.outputs.sg-id }}"; do
-            [ -z "$SG" ] && continue
-            # Wait up to 60s for associated instance to terminate
-            for i in $(seq 1 12); do
-              aws ec2 delete-security-group --group-id "$SG" 2>/dev/null && break
-              sleep 5
-            done
+          SG="${{ steps.sg.outputs.sg-id }}"
+          [ -z "$SG" ] && exit 0
+          for i in $(seq 1 12); do
+            aws ec2 delete-security-group --group-id "$SG" 2>/dev/null && break
+            sleep 5
           done
 
   # ── Centralised cleanup — runs even if the job is cancelled ───────────────────
@@ -476,7 +286,7 @@ jobs:
       - name: Delete security groups for this run
         run: |
           SG_IDS=$(aws ec2 describe-security-groups \
-            --filters "Name=group-name,Values=k3s-to-talos-ci-${{ github.run_id }}-*" \
+            --filters "Name=group-name,Values=k3s-to-talos-ci-${{ github.run_id }}*" \
             --query 'SecurityGroups[].GroupId' \
             --output text)
 

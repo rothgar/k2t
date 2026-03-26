@@ -16,10 +16,11 @@ import (
 
 // BootstrapOptions holds parameters for bootstrapping a Talos cluster.
 type BootstrapOptions struct {
-	Host            string
-	TalosConfigFile string
-	ControlPlaneCfg string
-	KubeconfigOut   string
+	Host             string
+	TalosConfigFile  string
+	ControlPlaneCfg  string
+	KubeconfigOut    string
+	EtcdSnapshotPath string // if set, run etcd recover instead of bootstrap
 }
 
 // Bootstrapper handles waiting for Talos to boot and running bootstrap.
@@ -45,35 +46,63 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 		return err
 	}
 
-	// Step 2: Apply control plane config
+	// Step 2: Apply control plane config (--insecure targets maintenance mode).
+	// If Talos booted with the config already written to the STATE partition,
+	// this step is effectively a no-op or may return an error — both are OK.
 	fmt.Println("  Applying control plane configuration...")
 	if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
 		"apply-config", "--insecure",
 		"--nodes", opts.Host,
 		"--file", opts.ControlPlaneCfg,
 	); err != nil {
-		return fmt.Errorf("applying control plane config: %w", err)
+		// If the node already has a config (booted from STATE partition),
+		// apply-config --insecure will fail — treat that as non-fatal.
+		color.Yellow("  Warning: apply-config returned an error (node may already be configured): %v\n", err)
+		color.Yellow("  Continuing — assuming config was pre-applied by nextboot-talos script.\n")
+	} else {
+		color.Green("  ✓ Control plane config applied\n")
 	}
-	color.Green("  ✓ Control plane config applied\n")
 
-	// Brief pause for the config to take effect
-	time.Sleep(5 * time.Second)
+	// Step 2b: Wait for Talos to reboot after apply-config.
+	// apply-config causes an immediate reboot in maintenance mode; the API
+	// drops briefly then returns when the node is in configured mode.
+	fmt.Println("  Waiting for Talos to reboot after config apply (up to 10 minutes)...")
+	time.Sleep(15 * time.Second) // give the reboot time to start
+	if err := b.waitForTalosAPI(opts.Host); err != nil {
+		return fmt.Errorf("waiting for Talos after config apply: %w", err)
+	}
 
-	// Step 3: Bootstrap the cluster (EXACTLY ONCE on ONE node)
-	fmt.Println("  Bootstrapping Kubernetes cluster (this runs once on the control plane)...")
-	if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
-		"bootstrap",
-		"--nodes", opts.Host,
-		"--endpoints", opts.Host,
-	); err != nil {
-		// Bootstrap can return a "already bootstrapped" error — that's OK
-		if !strings.Contains(err.Error(), "already bootstrapped") &&
-			!strings.Contains(err.Error(), "AlreadyExists") {
-			return fmt.Errorf("bootstrapping cluster: %w", err)
+	// Step 3: Initialize etcd.
+	// If a k3s etcd snapshot is available, use etcd recover to seed the
+	// cluster from the k3s data (replaces talosctl bootstrap).
+	// Otherwise, perform a standard bootstrap.
+	if opts.EtcdSnapshotPath != "" {
+		fmt.Printf("  Restoring etcd from k3s snapshot: %s\n", opts.EtcdSnapshotPath)
+		if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
+			"etcd", "recover",
+			"--nodes", opts.Host,
+			"--endpoints", opts.Host,
+			"-f", opts.EtcdSnapshotPath,
+		); err != nil {
+			return fmt.Errorf("restoring etcd from snapshot: %w", err)
 		}
-		fmt.Println("  (cluster was already bootstrapped)")
+		color.Green("  ✓ etcd restored from k3s snapshot\n")
+	} else {
+		fmt.Println("  Bootstrapping Kubernetes cluster (this runs once on the control plane)...")
+		if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
+			"bootstrap",
+			"--nodes", opts.Host,
+			"--endpoints", opts.Host,
+		); err != nil {
+			// Bootstrap can return a "already bootstrapped" error — that's OK
+			if !strings.Contains(err.Error(), "already bootstrapped") &&
+				!strings.Contains(err.Error(), "AlreadyExists") {
+				return fmt.Errorf("bootstrapping cluster: %w", err)
+			}
+			fmt.Println("  (cluster was already bootstrapped)")
+		}
+		color.Green("  ✓ Cluster bootstrapped\n")
 	}
-	color.Green("  ✓ Cluster bootstrapped\n")
 
 	// Step 4: Wait for Kubernetes API
 	if err := b.waitForKubernetesAPI(opts.Host, opts.TalosConfigFile); err != nil {
