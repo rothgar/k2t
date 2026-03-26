@@ -80,14 +80,22 @@ func Run(opts Options) error {
 	}
 	log("Disk write complete.")
 
-	// Refresh the kernel's view of the new partition table before accessing
-	// any of the Talos partitions.  Ubuntu's root filesystem is on the old
-	// partition 2, so partprobe may report EBUSY for that partition but will
-	// still update the unmounted partitions (EFI, STATE, etc.).
-	if out, err := exec.Command("partprobe", disk).CombinedOutput(); err != nil {
-		log("partprobe warning: %v (%s) — continuing", err, strings.TrimSpace(string(out)))
+	// Refresh the kernel's view of the new partition table.  On a live disk
+	// (root fs mounted on p2) partprobe/BLKRRPART will report EBUSY for
+	// partition 2 but still update the unmounted partitions (EFI, STATE).
+	// Try partx first (handles per-partition updates better), then partprobe.
+	if out, err := exec.Command("partx", "-u", disk).CombinedOutput(); err != nil {
+		log("partx warning: %v (%s)", err, strings.TrimSpace(string(out)))
+		if out2, err2 := exec.Command("partprobe", disk).CombinedOutput(); err2 != nil {
+			log("partprobe warning: %v (%s) — continuing without partition update",
+				err2, strings.TrimSpace(string(out2)))
+		}
 	}
-	time.Sleep(2 * time.Second)
+	// Give udev time to create/update partition device nodes.
+	if out, err := exec.Command("udevadm", "settle", "--timeout=5").CombinedOutput(); err != nil {
+		log("udevadm settle: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+	time.Sleep(time.Second)
 
 	// ── 4. Patch the Talos EFI partition so hardware reboot works on EC2 ────
 	// EC2's UEFI NVRAM still has the old OS's boot entry (e.g. pointing to
@@ -430,42 +438,13 @@ func kexecIntoTalos(imageURL string) error {
 	return nil // unreachable on success
 }
 
-// detectTalosPlatform returns the Talos platform string for the current
-// environment.  It checks DMI data and cloud-specific metadata to distinguish
-// between AWS EC2, GCP, Azure, and bare metal.
+// detectTalosPlatform returns the Talos platform string for kexec boot.
+// We use "metal" for all environments to avoid any cloud-platform-specific
+// initialisation that could block or delay boot (e.g. IMDSv2 timeouts on
+// EC2 instances configured with HttpTokens=required).  The metal platform
+// uses DHCP for networking and reads config from the STATE partition, which
+// works correctly on all major cloud providers.
 func detectTalosPlatform() string {
-	// AWS EC2: product_name in DMI is "HVM domU" or similar; also check uuid.
-	if data, err := os.ReadFile("/sys/class/dmi/id/product_name"); err == nil {
-		name := strings.TrimSpace(string(data))
-		if strings.Contains(strings.ToLower(name), "amazon") {
-			return "aws"
-		}
-	}
-	if data, err := os.ReadFile("/sys/class/dmi/id/sys_vendor"); err == nil {
-		vendor := strings.TrimSpace(string(data))
-		if strings.Contains(strings.ToLower(vendor), "amazon") {
-			return "aws"
-		}
-	}
-	// EC2 instance identity is also available via the hypervisor UUID.
-	if data, err := os.ReadFile("/sys/hypervisor/uuid"); err == nil {
-		uuid := strings.ToLower(strings.TrimSpace(string(data)))
-		if strings.HasPrefix(uuid, "ec2") {
-			return "aws"
-		}
-	}
-	// GCP: check board vendor or asset tag.
-	if data, err := os.ReadFile("/sys/class/dmi/id/board_vendor"); err == nil {
-		if strings.Contains(strings.ToLower(string(data)), "google") {
-			return "gcp"
-		}
-	}
-	// Azure: check chassis asset tag.
-	if data, err := os.ReadFile("/sys/class/dmi/id/chassis_asset_tag"); err == nil {
-		if strings.Contains(string(data), "7783-7084-3265-9085-8269-3286-77") {
-			return "azure"
-		}
-	}
 	return "metal"
 }
 
