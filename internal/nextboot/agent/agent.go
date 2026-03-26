@@ -80,6 +80,15 @@ func Run(opts Options) error {
 	}
 	log("Disk write complete.")
 
+	// Refresh the kernel's view of the new partition table before accessing
+	// any of the Talos partitions.  Ubuntu's root filesystem is on the old
+	// partition 2, so partprobe may report EBUSY for that partition but will
+	// still update the unmounted partitions (EFI, STATE, etc.).
+	if out, err := exec.Command("partprobe", disk).CombinedOutput(); err != nil {
+		log("partprobe warning: %v (%s) — continuing", err, strings.TrimSpace(string(out)))
+	}
+	time.Sleep(2 * time.Second)
+
 	// ── 4. Patch the Talos EFI partition so hardware reboot works on EC2 ────
 	// EC2's UEFI NVRAM still has the old OS's boot entry (e.g. pointing to
 	// EFI/ubuntu/shimx64.efi).  On EC2 the NVRAM is not updated by in-OS
@@ -274,8 +283,6 @@ func writeReaderToDisk(r io.Reader, disk string) error {
 // Talos GPT layout: EFI(1) BIOS(2) META(3) STATE(4) EPHEMERAL(5).
 // Partition 6 is tried as a fallback for older layouts.
 func writeConfig(disk string, config []byte) error {
-	exec.Command("partprobe", disk).Run() //nolint:errcheck
-	time.Sleep(2 * time.Second)
 
 	var candidates []string
 	if strings.Contains(disk, "nvme") || strings.Contains(disk, "mmcblk") {
@@ -327,11 +334,19 @@ func kexecIntoTalos(imageURL string) error {
 	// Check for kernel lockdown — kexec_load is blocked when lockdown is
 	// active (e.g. with Secure Boot on Ubuntu).  Skip early to avoid
 	// downloading several hundred MB only to fail.
+	//
+	// The file format is: "[none] integrity confidentiality" — the active
+	// mode is enclosed in brackets.  Parse that out before comparing.
 	if data, err := os.ReadFile("/sys/kernel/security/lockdown"); err == nil {
-		mode := strings.TrimSpace(string(data))
-		if mode != "none" && mode != "" {
-			return fmt.Errorf("kernel lockdown is active (%q); kexec_load is not permitted", mode)
+		content := strings.TrimSpace(string(data))
+		activeMode := content // fallback when no brackets present
+		if m := regexp.MustCompile(`\[([^\]]+)\]`).FindStringSubmatch(content); len(m) > 1 {
+			activeMode = m[1]
 		}
+		if activeMode != "none" && activeMode != "" {
+			return fmt.Errorf("kernel lockdown is active (%q); kexec_load is not permitted", activeMode)
+		}
+		log("Kernel lockdown: %s (kexec permitted)", activeMode)
 	}
 
 	// Derive kernel + initramfs URLs from the raw image URL.
