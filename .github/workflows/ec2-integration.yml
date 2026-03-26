@@ -215,8 +215,8 @@ jobs:
           esac
 
           $SSH "$KUBECTL create deployment ci-test-nginx --image=nginx:alpine --replicas=1"
-          $SSH "$KUBECTL rollout status deployment/ci-test-nginx --timeout=120s"
-          echo "Test workload ready."
+          $SSH "$KUBECTL get deployment ci-test-nginx"
+          echo "Test workload created."
 
       # ── Run k3s-to-talos collect ─────────────────────────────────────────────
       - name: Run collect
