@@ -350,9 +350,23 @@ jobs:
       # ── Bootstrap the Talos cluster ───────────────────────────────────────
       - name: Bootstrap Talos cluster
         run: |
-          talosctl bootstrap \
-            --nodes "$TALOS_IP" \
-            --talosconfig test-backup/talos-config/talosconfig
+          echo "Bootstrapping Talos (retrying up to 5 minutes for API readiness)..."
+          for i in $(seq 1 30); do
+            out=$(talosctl bootstrap \
+              --nodes "$TALOS_IP" \
+              --talosconfig test-backup/talos-config/talosconfig 2>&1) && {
+              echo "Bootstrap successful"
+              break
+            }
+            # "already bootstrapped" is not a real error
+            echo "$out" | grep -qi "already bootstrapped" && {
+              echo "etcd already bootstrapped — continuing"
+              break
+            }
+            echo "Bootstrap attempt $i failed: $out"
+            [ "$i" -eq 30 ] && { echo "Bootstrap failed after 30 attempts"; exit 1; }
+            sleep 10
+          done
 
       # ── Retrieve kubeconfig ───────────────────────────────────────────────
       - name: Retrieve kubeconfig
