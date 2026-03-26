@@ -1,27 +1,8 @@
 #!/bin/bash
 # cloud-init user-data: install kubeadm and initialise a single-node cluster.
-# This script is templated by the EC2 workflow: __SSH_PUBLIC_KEY__ is replaced
-# with the actual public key before the instance is launched.
+# Root SSH is set up by the workflow after the instance is reachable.
 set -euo pipefail
 
-# ── Root SSH access ────────────────────────────────────────────────────────────
-mkdir -p /root/.ssh
-chmod 700 /root/.ssh
-for dir in /home/ubuntu /home/admin /home/ec2-user; do
-  if [ -f "$dir/.ssh/authorized_keys" ]; then
-    cat "$dir/.ssh/authorized_keys" >> /root/.ssh/authorized_keys
-    break
-  fi
-done
-echo "__SSH_PUBLIC_KEY__" >> /root/.ssh/authorized_keys
-chmod 600 /root/.ssh/authorized_keys
-
-for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/60-cloudimg-settings.conf; do
-  [ -f "$f" ] && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' "$f"
-done
-systemctl restart sshd 2>/dev/null || service sshd restart 2>/dev/null || true
-
-# ── System preparation ─────────────────────────────────────────────────────────
 export DEBIAN_FRONTEND=noninteractive
 
 # Disable swap (required by kubelet).
@@ -71,7 +52,6 @@ apt-mark hold kubelet kubeadm kubectl
 systemctl enable kubelet
 
 # ── Cluster initialisation ─────────────────────────────────────────────────────
-# Get the primary private IP for the advertise address.
 ADVERTISE_IP=$(hostname -I | awk '{print $1}')
 
 kubeadm init \
