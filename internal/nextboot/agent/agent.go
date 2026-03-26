@@ -67,7 +67,26 @@ func Run(opts Options) error {
 		}
 	}
 
-	// ── 3. Download, decompress, write to disk in one streaming pipeline ─────
+	// ── 3. Pre-load Talos kernel via kexec (before disk write) ───────────────
+	// Loading the kernel into RAM *before* overwriting the disk is critical:
+	//  • kexec -l operates on the still-intact Ubuntu system, so no stale
+	//    page-cache or partition-table races
+	//  • If kexec is blocked (Secure Boot / kernel lockdown) we find out now
+	//    and can prepare the EFI fallback path instead of discovering it after
+	//    the disk is already overwritten
+	//  • On success the new kernel sits in RAM; kexec -e fires it instantly
+	//    after the disk is written, completely bypassing UEFI boot order
+	kexecLoaded := false
+	if opts.Reboot {
+		if err := prepareKexec(opts.ImageURL); err != nil {
+			log("kexec preparation failed (%v); will rely on hardware reboot.", err)
+		} else {
+			kexecLoaded = true
+			log("Talos kernel loaded into RAM — will kexec after imaging.")
+		}
+	}
+
+	// ── 4. Download, decompress, write to disk in one streaming pipeline ─────
 	log("Starting download → decompress → disk pipeline...")
 	log("  !! This will ERASE all data on %s. Starting in 5 seconds !!", disk)
 	for i := 5; i > 0; i-- {
@@ -151,20 +170,25 @@ func Run(opts Options) error {
 	log("═══════════════════════════════════════════════════════════")
 	log("Talos installation complete.")
 
-	// ── 6. Reboot into Talos ─────────────────────────────────────────────────
+	// ── 8. Reboot into Talos ─────────────────────────────────────────────────
 	if opts.Reboot {
 		log("Booting into Talos Linux...")
 		time.Sleep(2 * time.Second)
 
-		// kexec bypasses UEFI/BIOS entirely, which is critical on cloud VMs
-		// (e.g. EC2) where the firmware NVRAM still points to the old OS and
-		// the hypervisor does not reliably fall back to \EFI\BOOT\BOOTX64.EFI.
-		if err := kexecIntoTalos(opts.ImageURL); err != nil {
-			log("kexec not available or failed (%v); falling back to hardware reboot...", err)
-			return reboot()
+		if kexecLoaded {
+			log("Executing pre-loaded Talos kernel via kexec...")
+			if out, err := exec.Command("kexec", "-e").CombinedOutput(); err != nil {
+				// kexec -e only returns on failure; success kills the process.
+				log("kexec -e failed (%v: %s); falling back to hardware reboot...",
+					err, strings.TrimSpace(string(out)))
+			} else {
+				// Unreachable if kexec succeeded.
+				log("kexec -e returned unexpectedly (no error); hardware reboot...")
+			}
+		} else {
+			log("kexec not loaded — relying on hardware reboot via EFI patching...")
 		}
-		// kexec executed — we should never reach here; fall through to reboot
-		// just in case (belt-and-suspenders).
+
 		return reboot()
 	}
 	log("AUTO_REBOOT disabled — run 'reboot' manually to boot into Talos.")
@@ -367,17 +391,15 @@ func writeConfig(disk string, config []byte) error {
 
 // ── kexec boot ───────────────────────────────────────────────────────────────
 
-// kexecIntoTalos downloads the Talos kernel and initramfs from the same image
-// factory URL, then uses kexec to boot into them directly.
+// prepareKexec downloads the Talos kernel and initramfs, then runs
+// "kexec -l" to load them into RAM.  The new kernel is not executed yet;
+// the caller can complete disk preparation and then call "kexec -e".
 //
-// kexec bypasses the UEFI/BIOS boot sequence entirely.  This is the most
-// reliable approach on cloud VMs (AWS EC2, GCP, Azure) where the firmware
-// NVRAM still references the old OS after the disk is overwritten.
-//
-// When kexec succeeds this function does not return — the calling process is
-// killed when the kernel switches.  On failure it returns an error so the
-// caller can fall back to a hardware reboot.
-func kexecIntoTalos(imageURL string) error {
+// Separating load from execute is intentional: the load happens while the
+// system is fully intact (Ubuntu running), so there are no stale partition
+// caches or other post-dd races.  If loading fails (Secure Boot / lockdown)
+// we know before the disk is overwritten and can prepare EFI fallback paths.
+func prepareKexec(imageURL string) error {
 	// Check for kernel lockdown — kexec_load is blocked when lockdown is
 	// active (e.g. with Secure Boot on Ubuntu).  Skip early to avoid
 	// downloading several hundred MB only to fail.
@@ -447,24 +469,18 @@ func kexecIntoTalos(imageURL string) error {
 		log("Talos initramfs downloaded: %d bytes (%.1f MiB)", fi.Size(), float64(fi.Size())/(1024*1024))
 	}
 
-	// Detect the cloud platform so Talos uses the right platform driver.
-	// On AWS EC2, talos.platform=aws enables IMDS-based network configuration
-	// and EC2-specific integrations.  On bare metal, use metal.
-	platform := detectTalosPlatform()
-	log("Detected Talos platform: %s", platform)
-
 	// Build kernel command line.
-	// net.ifnames=0  — use predictable eth0/eth1 naming (not ens5/enp0s3).
-	// console baud   — 115200 is standard for EC2 serial console.
-	cmdLine := fmt.Sprintf(
-		"console=tty0 console=ttyS0,115200 talos.platform=%s "+
-			"net.ifnames=0 init_on_alloc=1 slab_nomerge pti=on "+
-			"consoleblank=0 random.trust_cpu=on printk.devkmsg=on",
-		platform,
-	)
+	// talos.platform=metal — use DHCP for networking; reads config from the
+	//   STATE partition.  Works on all cloud providers and avoids IMDSv2
+	//   timeouts on EC2 instances with HttpTokens=required.
+	// net.ifnames=0 — use predictable eth0/eth1 naming (not ens5/enp0s3).
+	// console baud  — 115200 is standard for EC2 serial console.
+	cmdLine := "console=tty0 console=ttyS0,115200 talos.platform=metal " +
+		"net.ifnames=0 init_on_alloc=1 slab_nomerge pti=on " +
+		"consoleblank=0 random.trust_cpu=on printk.devkmsg=on"
 	log("kexec cmdline: %s", cmdLine)
 
-	log("Loading kernel via kexec...")
+	log("Loading Talos kernel into RAM via kexec -l ...")
 	if out, err := exec.Command("kexec",
 		"-l", kernelPath,
 		"--initrd="+initrdPath,
@@ -473,14 +489,8 @@ func kexecIntoTalos(imageURL string) error {
 		return fmt.Errorf("kexec -l: %w\n%s", err, string(out))
 	}
 
-	log("Executing kexec — switching to Talos kernel NOW...")
-	// This call replaces the running kernel; the process (and all others) are
-	// killed immediately.  If it returns, something went wrong.
-	out, err := exec.Command("kexec", "-e").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("kexec -e: %w\n%s", err, string(out))
-	}
-	return nil // unreachable on success
+	log("kexec -l succeeded — Talos kernel is staged in RAM, ready to execute.")
+	return nil
 }
 
 // detectTalosPlatform returns the Talos platform string for kexec boot.
