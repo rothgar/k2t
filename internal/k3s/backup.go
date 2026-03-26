@@ -378,7 +378,7 @@ func (b *Backup) exportResources(kubeconfigPath string, info *ClusterInfo) error
 				continue
 			}
 
-			name := item.GetName()
+			name := strings.ReplaceAll(item.GetName(), ":", "_")
 			ns := item.GetNamespace()
 			var fname string
 			if ns != "" {
