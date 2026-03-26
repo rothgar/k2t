@@ -209,20 +209,17 @@ func (b *Backup) downloadKubeconfig(localPath string) error {
 // insecure-skip-tls-verify so client-go can connect without cert validation.
 // This is intentional for the collect/backup phase only.
 func rewriteKubeconfigInsecure(kubeconfig string) string {
-	// Remove any existing certificate-authority-data line (may span multiple
-	// lines due to base64; the value is on a single line in standard kubeconfigs).
+	// Replace each certificate-authority-data line with insecure-skip-tls-verify.
+	// A kubeconfig may have multiple cluster entries, each with its own cert line.
+	// The cert value is always on a single line in standard kubeconfig output.
 	lines := strings.Split(kubeconfig, "\n")
 	out := make([]string, 0, len(lines))
-	insertedInsecure := false
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "certificate-authority-data:") {
-			if !insertedInsecure {
-				// Preserve indentation
-				indent := strings.Repeat(" ", len(line)-len(strings.TrimLeft(line, " ")))
-				out = append(out, indent+"insecure-skip-tls-verify: true")
-				insertedInsecure = true
-			}
+			// Preserve original indentation.
+			indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+			out = append(out, indent+"insecure-skip-tls-verify: true")
 			continue // drop the cert data line
 		}
 		out = append(out, line)

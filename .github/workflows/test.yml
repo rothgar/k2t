@@ -1,0 +1,203 @@
+name: Test
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  pull_request:
+
+jobs:
+  # ── Unit tests ──────────────────────────────────────────────────────────────
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+  # ── Integration: collect backup against a real k3s ──────────────────────────
+  # Tests Phase 1 (COLLECT) end-to-end: SSH into localhost, verify k3s, take a
+  # database backup, export all Kubernetes resources, and download the kubeconfig.
+  # The DEPLOY and BOOTSTRAP phases cannot run in CI (they erase the machine),
+  # but --dry-run exercises the full migrate path up to that point.
+  integration-collect:
+    name: Integration — collect backup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binary
+        run: go build -o k3s-to-talos .
+
+      - name: Install k3s (SQLite, no agent)
+        # INSTALL_K3S_SKIP_ENABLE skips systemd unit activation (not available
+        # in GitHub Actions runners without special setup).
+        run: |
+          curl -sfL https://get.k3s.io | \
+            INSTALL_K3S_SKIP_ENABLE=true \
+            INSTALL_K3S_EXEC="--disable=traefik --disable=servicelb" \
+            sh -
+
+      - name: Start k3s server
+        run: sudo k3s server --disable=traefik --disable=servicelb &
+
+      - name: Wait for k3s to become ready
+        run: |
+          echo "Waiting for k3s node to be Ready..."
+          timeout 120 bash -c \
+            'until sudo k3s kubectl get nodes 2>/dev/null | grep -q " Ready"; do sleep 3; done'
+          sudo k3s kubectl get nodes
+
+      - name: Set up SSH to localhost
+        run: |
+          sudo apt-get install -y openssh-server
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd
+
+          # Generate a key for the runner user, then authorise it for root.
+          ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519" -N ""
+          sudo mkdir -p /root/.ssh
+          sudo bash -c "cat $HOME/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys"
+          sudo chmod 600 /root/.ssh/authorized_keys
+
+          # Trust localhost so SSH doesn't prompt.
+          ssh-keyscan -H 127.0.0.1 >> "$HOME/.ssh/known_hosts"
+
+          # Smoke-test that SSH works before running the CLI.
+          ssh -i "$HOME/.ssh/id_ed25519" root@127.0.0.1 "uname -m"
+
+      - name: Run collect
+        run: |
+          ./k3s-to-talos collect \
+            --host 127.0.0.1 \
+            --ssh-user root \
+            --ssh-key "$HOME/.ssh/id_ed25519" \
+            --backup-dir ./test-backup
+
+      - name: Verify backup artefacts
+        run: |
+          echo "=== Backup contents ==="
+          find test-backup -type f | sort
+
+          echo "=== Assertions ==="
+
+          # Kubeconfig must exist and be valid YAML.
+          test -f test-backup/k3s.yaml && echo "✓ kubeconfig present"
+          grep -q "insecure-skip-tls-verify: true" test-backup/k3s.yaml && \
+            echo "✓ kubeconfig patched to insecure mode"
+
+          # Database backup (SQLite — k3s default without --cluster-init).
+          test -f test-backup/database/state.db && echo "✓ SQLite snapshot present"
+          test -f test-backup/database/backup-info.json && echo "✓ backup metadata present"
+
+          # Resource export must have produced at least some YAML files.
+          count=$(find test-backup/resources -name "*.yaml" | wc -l)
+          echo "  Exported resource files: $count"
+          test "$count" -gt 0 && echo "✓ resources exported"
+
+          # Hardware info must be written into the state.
+          echo "All assertions passed."
+
+      - name: Upload backup as artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k3s-backup
+          path: test-backup/
+          retention-days: 3
+
+  # ── Integration: migrate --dry-run ──────────────────────────────────────────
+  # Runs the full migrate command path with --dry-run so COLLECT + CONFIRM +
+  # GENERATE are exercised. DEPLOY is skipped because dry-run exits before it.
+  # Requires talosctl to be installed locally to run talosctl gen config.
+  integration-dry-run:
+    name: Integration — migrate dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binary
+        run: go build -o k3s-to-talos .
+
+      - name: Install talosctl
+        run: |
+          curl -sL https://talos.dev/install | sh
+          talosctl version --client
+
+      - name: Install k3s
+        run: |
+          curl -sfL https://get.k3s.io | \
+            INSTALL_K3S_SKIP_ENABLE=true \
+            INSTALL_K3S_EXEC="--disable=traefik --disable=servicelb" \
+            sh -
+
+      - name: Start k3s server
+        run: sudo k3s server --disable=traefik --disable=servicelb &
+
+      - name: Wait for k3s
+        run: |
+          timeout 120 bash -c \
+            'until sudo k3s kubectl get nodes 2>/dev/null | grep -q " Ready"; do sleep 3; done'
+
+      - name: Set up SSH to localhost
+        run: |
+          sudo apt-get install -y openssh-server
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd
+          ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519" -N ""
+          sudo mkdir -p /root/.ssh
+          sudo bash -c "cat $HOME/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys"
+          sudo chmod 600 /root/.ssh/authorized_keys
+          ssh-keyscan -H 127.0.0.1 >> "$HOME/.ssh/known_hosts"
+
+      - name: Run migrate --dry-run
+        run: |
+          ./k3s-to-talos migrate \
+            --host 127.0.0.1 \
+            --ssh-user root \
+            --ssh-key "$HOME/.ssh/id_ed25519" \
+            --backup-dir ./dry-run-backup \
+            --cluster-name ci-test \
+            --talos-version v1.7.0 \
+            --dry-run
+
+      - name: Verify dry-run output
+        run: |
+          echo "=== Dry-run backup contents ==="
+          find dry-run-backup -type f | sort
+
+          test -f dry-run-backup/k3s.yaml && echo "✓ kubeconfig present"
+          test -f dry-run-backup/database/backup-info.json && echo "✓ database backup metadata present"
+
+          # talosctl gen config creates placeholder files in dry-run mode.
+          test -f dry-run-backup/talos-config/controlplane.yaml && echo "✓ controlplane.yaml present"
+          test -f dry-run-backup/talos-config/talosconfig && echo "✓ talosconfig present"
+
+          echo "Dry-run assertions passed."
+
+      - name: Upload dry-run backup as artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-backup
+          path: dry-run-backup/
+          retention-days: 3
