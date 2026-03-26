@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -150,6 +151,8 @@ func (b *Bootstrapper) waitForTalosAPI(host string) error {
 	url := fmt.Sprintf("https://%s:50000", host)
 	deadline := time.Now().Add(20 * time.Minute)
 	wait := 5 * time.Second
+	start := time.Now()
+	sshChecked := false
 
 	for time.Now().Before(deadline) {
 		resp, err := httpClient.Get(url)
@@ -158,6 +161,25 @@ func (b *Bootstrapper) waitForTalosAPI(host string) error {
 			s.Stop()
 			color.Green("  ✓ Talos API is responding at %s\n", url)
 			return nil
+		}
+
+		// After 3 minutes of waiting, check if port 22 (SSH) is responding.
+		// If it is, the machine rebooted back into Ubuntu instead of Talos —
+		// a clear sign that kexec failed AND the EFI boot path didn't work.
+		if !sshChecked && time.Since(start) > 3*time.Minute {
+			sshChecked = true
+			if conn, tcpErr := net.DialTimeout("tcp", host+":22", 3*time.Second); tcpErr == nil {
+				conn.Close()
+				s.Stop()
+				color.Yellow("\n  ⚠  Port 22 (SSH) is responding on %s\n", host)
+				color.Yellow("  ⚠  This means the machine rebooted back into Ubuntu, not Talos!\n")
+				color.Yellow("  ⚠  Likely causes:\n")
+				color.Yellow("  ⚠    • kexec was blocked (kernel lockdown / Secure Boot enabled)\n")
+				color.Yellow("  ⚠    • Hardware reboot booted Ubuntu (EFI path patch failed)\n")
+				color.Yellow("  ⚠    • EFI partition had stale page cache during the EFI copy\n")
+				color.Yellow("  ⚠  Continuing to wait for Talos API (may not succeed)...\n\n")
+				s.Start()
+			}
 		}
 
 		// Also accept connection refused → Talos is up but not yet serving

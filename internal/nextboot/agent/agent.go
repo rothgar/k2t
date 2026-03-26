@@ -75,10 +75,30 @@ func Run(opts Options) error {
 		time.Sleep(time.Second)
 	}
 
+	// Log disk layout before imaging for diagnostics.
+	if out, err := exec.Command("lsblk", "-o", "NAME,SIZE,TYPE,MOUNTPOINT", disk).CombinedOutput(); err == nil {
+		log("Disk layout before imaging:\n%s", strings.TrimSpace(string(out)))
+	}
+
 	if err := streamImageToDisk(opts.ImageURL, opts.ImageHash, disk); err != nil {
 		return fmt.Errorf("imaging disk: %w", err)
 	}
 	log("Disk write complete.")
+
+	// Flush all dirty pages to disk and drop the page cache so that
+	// subsequent partition mounts see the Talos data we just wrote rather
+	// than stale Ubuntu content.  This is especially important for the EFI
+	// partition (/dev/xvda1) which Ubuntu has mounted at /boot/efi — after
+	// dd the kernel's page cache for that device still contains Ubuntu EFI
+	// files until explicitly dropped.
+	exec.Command("sync").Run() //nolint:errcheck
+	if f, err := os.OpenFile("/proc/sys/vm/drop_caches", os.O_WRONLY, 0); err == nil {
+		_, _ = f.WriteString("3\n")
+		f.Close()
+		log("Global sync + page cache dropped — subsequent reads will see new disk content.")
+	} else {
+		log("Warning: could not drop page cache (%v); stale reads possible.", err)
+	}
 
 	// Refresh the kernel's view of the new partition table.  On a live disk
 	// (root fs mounted on p2) partprobe/BLKRRPART will report EBUSY for
@@ -92,10 +112,15 @@ func Run(opts Options) error {
 		}
 	}
 	// Give udev time to create/update partition device nodes.
-	if out, err := exec.Command("udevadm", "settle", "--timeout=5").CombinedOutput(); err != nil {
+	if out, err := exec.Command("udevadm", "settle", "--timeout=10").CombinedOutput(); err != nil {
 		log("udevadm settle: %v (%s)", err, strings.TrimSpace(string(out)))
 	}
-	time.Sleep(time.Second)
+	time.Sleep(2 * time.Second)
+
+	// Log disk layout after partition refresh for diagnostics.
+	if out, err := exec.Command("lsblk", "-o", "NAME,SIZE,TYPE,MOUNTPOINT", disk).CombinedOutput(); err == nil {
+		log("Disk layout after partition refresh:\n%s", strings.TrimSpace(string(out)))
+	}
 
 	// ── 4. Patch the Talos EFI partition so hardware reboot works on EC2 ────
 	// EC2's UEFI NVRAM still has the old OS's boot entry (e.g. pointing to
@@ -410,10 +435,16 @@ func kexecIntoTalos(imageURL string) error {
 	if err := os.Chmod(kernelPath, 0755); err != nil {
 		return err
 	}
+	if fi, err := os.Stat(kernelPath); err == nil {
+		log("Talos kernel downloaded: %d bytes (%.1f MiB)", fi.Size(), float64(fi.Size())/(1024*1024))
+	}
 
 	log("Downloading Talos initramfs from %s ...", initrdURL)
 	if err := downloadFileTo(initrdURL, initrdPath); err != nil {
 		return fmt.Errorf("downloading initramfs: %w", err)
+	}
+	if fi, err := os.Stat(initrdPath); err == nil {
+		log("Talos initramfs downloaded: %d bytes (%.1f MiB)", fi.Size(), float64(fi.Size())/(1024*1024))
 	}
 
 	// Detect the cloud platform so Talos uses the right platform driver.
@@ -517,15 +548,42 @@ func copyTalosEFIToLegacyPaths(disk string) error {
 		return fmt.Errorf("EFI partition %s not found: %w", efiPart, err)
 	}
 
+	// Flush block buffers for the EFI partition to ensure the new Talos
+	// content is visible (not the cached Ubuntu EFI files).
+	exec.Command("blockdev", "--flushbufs", efiPart).Run() //nolint:errcheck
+
+	// Unmount any stale mount of the EFI partition (Ubuntu mounts it at
+	// /boot/efi).  After dd-ing a new image the VFS superblock is stale; a
+	// lazy unmount + fresh remount forces the kernel to re-read the new
+	// Talos FAT filesystem from disk.
+	for _, staleMP := range []string{"/boot/efi", "/boot/efi/"} {
+		exec.Command("umount", "-l", staleMP).Run() //nolint:errcheck
+	}
+
 	mountPoint, err := os.MkdirTemp("", "talos-efi-*")
 	if err != nil {
 		return fmt.Errorf("creating mount point: %w", err)
 	}
 	defer os.RemoveAll(mountPoint)
 
-	if err := exec.Command("mount", efiPart, mountPoint).Run(); err != nil {
-		return fmt.Errorf("mounting EFI partition %s: %w", efiPart, err)
+	if err := exec.Command("mount", "-o", "ro", efiPart, mountPoint).Run(); err != nil {
+		// Try without -o ro in case of format quirks.
+		if err2 := exec.Command("mount", efiPart, mountPoint).Run(); err2 != nil {
+			return fmt.Errorf("mounting EFI partition %s: %w", efiPart, err2)
+		}
 	}
+
+	// Verify we have Talos content (not stale Ubuntu) by checking the
+	// canonical Talos GRUB binary.
+	talosEFICheck := filepath.Join(mountPoint, "EFI", "BOOT", "BOOTX64.EFI")
+	if _, err := os.Stat(talosEFICheck); err != nil {
+		exec.Command("umount", mountPoint).Run() //nolint:errcheck
+		return fmt.Errorf("mounted EFI partition does not contain Talos BOOTX64.EFI "+
+			"(may be stale Ubuntu EFI); path %s missing: %w", talosEFICheck, err)
+	}
+
+	// Remount read-write so we can copy files.
+	exec.Command("mount", "-o", "remount,rw", mountPoint).Run() //nolint:errcheck
 	defer exec.Command("umount", mountPoint).Run() //nolint:errcheck
 
 	// Find the Talos GRUB binary.  Try the fallback path first, then the
