@@ -222,6 +222,46 @@ jobs:
               "${{ matrix.ssh_user }}@$INSTANCE_IP" \
               "sudo cloud-init status --wait" 2>&1 || true
 
+      # ── Deploy a test workload so we can verify it survives in the backup ───
+      - name: Deploy test workload
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${{ matrix.ssh_user }}@$INSTANCE_IP"
+
+          case "${{ matrix.cluster }}" in
+            k3s)     KUBECTL="sudo k3s kubectl" ;;
+            kubeadm) KUBECTL="sudo kubectl" ;;
+          esac
+
+          cat <<'MANIFEST' | $SSH "$KUBECTL apply -f -"
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ci-test-nginx
+            namespace: default
+            labels:
+              app: ci-test-nginx
+              source: k3s-to-talos-ci
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: ci-test-nginx
+            template:
+              metadata:
+                labels:
+                  app: ci-test-nginx
+              spec:
+                containers:
+                - name: nginx
+                  image: nginx:alpine
+                  ports:
+                  - containerPort: 80
+          MANIFEST
+
+          # Wait for rollout (up to 2 min).
+          $SSH "$KUBECTL rollout status deployment/ci-test-nginx --timeout=120s"
+          echo "Test workload ready."
+
       # ── Run k3s-to-talos collect ─────────────────────────────────────────────
       - name: Run collect
         run: |
@@ -261,6 +301,11 @@ jobs:
               test -f test-backup/database/etcd-snapshot.db && echo "✓ etcd snapshot present"
               ;;
           esac
+
+          # Verify the test workload was captured in the backup.
+          test -f "test-backup/resources/deployments/default__ci-test-nginx.yaml" \
+            && echo "✓ test workload (ci-test-nginx) present in backup" \
+            || { echo "✗ test workload missing from backup"; exit 1; }
 
           echo "All assertions passed."
 
