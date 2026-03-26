@@ -40,7 +40,8 @@ func PrintClusterSummary(info *k3s.ClusterInfo, backupDir string) {
 	bold.Println("  Collected Cluster Information")
 	fmt.Println()
 
-	fmt.Printf("  %-22s %s\n", "k3s version:", info.K3sVersion)
+	fmt.Printf("  %-22s %s\n", "Distribution:", info.ClusterType)
+	fmt.Printf("  %-22s %s\n", "Version:", info.K3sVersion)
 	fmt.Printf("  %-22s %s\n", "Kubernetes version:", info.K8sVersion)
 	fmt.Printf("  %-22s %s\n", "Datastore:", info.DatastoreType)
 	if info.Hardware != nil {

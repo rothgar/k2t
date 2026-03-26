@@ -11,9 +11,10 @@ import (
 	"github.com/rothgar/k3s-to-talos/internal/talos"
 )
 
-// ClusterInfo holds information about the k3s cluster gathered remotely.
+// ClusterInfo holds information about the cluster gathered remotely.
 type ClusterInfo struct {
-	K3sVersion    string              `json:"k3s_version"`
+	ClusterType   string              `json:"cluster_type"` // "k3s" | "kubeadm"
+	K3sVersion    string              `json:"k3s_version"`  // raw version string from k3s/kubelet
 	K8sVersion    string              `json:"k8s_version"`
 	ClusterName   string              `json:"cluster_name"`
 	Nodes         []Node              `json:"nodes"`
@@ -43,14 +44,31 @@ type PV struct {
 	ClaimRef         string `json:"claim_ref,omitempty"`
 }
 
-// Collector gathers k3s cluster information via SSH.
+// Collector gathers cluster information via SSH for both k3s and kubeadm nodes.
 type Collector struct {
-	ssh *ssh.Client
+	ssh         *ssh.Client
+	clusterType string // ClusterTypeK3s | ClusterTypeKubeadm
 }
 
-// NewCollector creates a new Collector.
+// NewCollector creates a k3s Collector. Prefer Detect() for automatic type selection.
 func NewCollector(ssh *ssh.Client) *Collector {
-	return &Collector{ssh: ssh}
+	return &Collector{ssh: ssh, clusterType: ClusterTypeK3s}
+}
+
+// kubectlBin returns the kubectl command appropriate for this cluster type.
+func (c *Collector) kubectlBin() string {
+	if c.clusterType == ClusterTypeKubeadm {
+		return "kubectl --kubeconfig /etc/kubernetes/admin.conf"
+	}
+	return "k3s kubectl"
+}
+
+// kubeconfigPath returns the remote path to the cluster admin kubeconfig.
+func (c *Collector) kubeconfigPath() string {
+	if c.clusterType == ClusterTypeKubeadm {
+		return "/etc/kubernetes/admin.conf"
+	}
+	return "/etc/rancher/k3s/k3s.yaml"
 }
 
 // Collect gathers all cluster information from the remote node.
@@ -60,9 +78,9 @@ func (c *Collector) Collect() (*ClusterInfo, error) {
 	s.Start()
 	defer s.Stop()
 
-	info := &ClusterInfo{}
+	info := &ClusterInfo{ClusterType: c.clusterType}
 
-	if err := c.verifyK3sServer(); err != nil {
+	if err := c.verifyServer(); err != nil {
 		return nil, err
 	}
 
@@ -107,8 +125,16 @@ func (c *Collector) Collect() (*ClusterInfo, error) {
 	return info, nil
 }
 
+func (c *Collector) verifyServer() error {
+	switch c.clusterType {
+	case ClusterTypeKubeadm:
+		return c.verifyKubeadmControlPlane()
+	default:
+		return c.verifyK3sServer()
+	}
+}
+
 func (c *Collector) verifyK3sServer() error {
-	// Check via systemctl first; fall back to process detection for non-systemd systems.
 	active, _ := c.ssh.Run(
 		`systemctl is-active k3s 2>/dev/null || ` +
 			`systemctl is-active k3s-server 2>/dev/null || ` +
@@ -118,31 +144,49 @@ func (c *Collector) verifyK3sServer() error {
 		return fmt.Errorf("k3s server does not appear to be running on the target machine\n" +
 			"Ensure the k3s server process is active before migrating.")
 	}
-
-	// Confirm it's in server mode (not just agent)
-	serverConfig := c.ssh.FileExists("/etc/rancher/k3s/k3s.yaml") ||
-		c.ssh.FileExists("/var/lib/rancher/k3s/server")
-	if !serverConfig {
+	if !c.ssh.FileExists("/etc/rancher/k3s/k3s.yaml") && !c.ssh.FileExists("/var/lib/rancher/k3s/server") {
 		return fmt.Errorf("target machine does not appear to be a k3s server node (missing /etc/rancher/k3s/k3s.yaml)")
 	}
+	return nil
+}
 
+func (c *Collector) verifyKubeadmControlPlane() error {
+	active, _ := c.ssh.Run(
+		`systemctl is-active kubelet 2>/dev/null || ` +
+			`(pgrep -f kubelet >/dev/null 2>&1 && echo active) || ` +
+			`echo inactive`)
+	if strings.TrimSpace(active) == "inactive" {
+		return fmt.Errorf("kubelet does not appear to be running on the target machine\n" +
+			"Ensure kubelet is active before migrating.")
+	}
+	if !c.ssh.FileExists("/etc/kubernetes/admin.conf") {
+		return fmt.Errorf("target machine does not appear to be a kubeadm control-plane node\n" +
+			"(missing /etc/kubernetes/admin.conf — is this a worker node only?)")
+	}
 	return nil
 }
 
 func (c *Collector) collectVersion(info *ClusterInfo) error {
-	v, err := c.ssh.Run("k3s --version 2>/dev/null | head -1")
+	var vCmd string
+	if c.clusterType == ClusterTypeKubeadm {
+		vCmd = "kubelet --version 2>/dev/null"
+	} else {
+		vCmd = "k3s --version 2>/dev/null | head -1"
+	}
+
+	v, err := c.ssh.Run(vCmd)
 	if err != nil {
-		return fmt.Errorf("getting k3s version: %w", err)
+		return fmt.Errorf("getting version: %w", err)
 	}
 	info.K3sVersion = strings.TrimSpace(v)
 
-	kv, _ := c.ssh.Run("k3s kubectl version --short 2>/dev/null | grep 'Server Version' | awk '{print $3}'")
+	kv, _ := c.ssh.Run(c.kubectlBin() + " version --short 2>/dev/null | grep 'Server Version' | awk '{print $3}'")
 	info.K8sVersion = strings.TrimSpace(kv)
 	return nil
 }
 
 func (c *Collector) collectNodes(info *ClusterInfo) error {
-	out, err := c.ssh.Run("k3s kubectl get nodes -o json 2>/dev/null")
+	out, err := c.ssh.Run(c.kubectlBin() + " get nodes -o json 2>/dev/null")
 	if err != nil {
 		return fmt.Errorf("listing nodes: %w", err)
 	}
@@ -215,6 +259,11 @@ func (c *Collector) collectNodes(info *ClusterInfo) error {
 }
 
 func (c *Collector) detectDatastore(info *ClusterInfo) {
+	if c.clusterType == ClusterTypeKubeadm {
+		// kubeadm always uses etcd (either stacked or external).
+		info.DatastoreType = "etcd"
+		return
+	}
 	// k3s with --cluster-init runs embedded etcd; etcd member files appear under
 	// the etcd/member directory.  A bare etcd/ directory can exist even in SQLite
 	// mode (k3s creates it), so we look for the member subdirectory specifically.
@@ -226,20 +275,20 @@ func (c *Collector) detectDatastore(info *ClusterInfo) {
 }
 
 func (c *Collector) collectWorkloads(info *ClusterInfo) error {
-	nsOut, err := c.ssh.Run("k3s kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null")
+	nsOut, err := c.ssh.Run(c.kubectlBin() + " get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null")
 	if err != nil {
 		return err
 	}
 	info.Namespaces = strings.Fields(nsOut)
 
 	countOut, _ := c.ssh.Run(
-		"k3s kubectl get deployments,statefulsets,daemonsets --all-namespaces --no-headers 2>/dev/null | wc -l")
+		c.kubectlBin() + " get deployments,statefulsets,daemonsets --all-namespaces --no-headers 2>/dev/null | wc -l")
 	fmt.Sscanf(strings.TrimSpace(countOut), "%d", &info.WorkloadCount)
 	return nil
 }
 
 func (c *Collector) collectPVs(info *ClusterInfo) error {
-	out, err := c.ssh.Run("k3s kubectl get pv -o json 2>/dev/null")
+	out, err := c.ssh.Run(c.kubectlBin() + " get pv -o json 2>/dev/null")
 	if err != nil {
 		return err
 	}

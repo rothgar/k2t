@@ -1,0 +1,309 @@
+name: EC2 Integration Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+# Required for OIDC token issuance (AWS credential federation).
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  INSTANCE_TYPE: t3.medium
+
+jobs:
+  # ── Build binary once, share as artifact ──────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go build -o k3s-to-talos .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: k3s-to-talos-binary
+          path: k3s-to-talos
+          retention-days: 1
+
+  # ── Resolve AMI IDs once so the matrix jobs don't each call SSM ───────────────
+  resolve-amis:
+    name: Resolve AMI IDs
+    runs-on: ubuntu-latest
+    outputs:
+      ubuntu-2204: ${{ steps.amis.outputs.ubuntu-2204 }}
+      ubuntu-2404: ${{ steps.amis.outputs.ubuntu-2404 }}
+      debian-12:   ${{ steps.amis.outputs.debian-12   }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve AMI IDs via SSM
+        id: amis
+        run: |
+          u22=$(aws ssm get-parameter \
+            --name /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id \
+            --query 'Parameter.Value' --output text)
+          echo "ubuntu-2204=$u22" >> "$GITHUB_OUTPUT"
+
+          u24=$(aws ssm get-parameter \
+            --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
+            --query 'Parameter.Value' --output text)
+          echo "ubuntu-2404=$u24" >> "$GITHUB_OUTPUT"
+
+          # Debian publishes AMIs via their own SSM namespace.
+          deb12=$(aws ssm get-parameter \
+            --name /aws/service/debian/release/bookworm/latest/amd64 \
+            --query 'Parameter.Value' --output text 2>/dev/null) || \
+          deb12=$(aws ec2 describe-images \
+            --owners 136693071363 \
+            --filters "Name=name,Values=debian-12-amd64-*" "Name=state,Values=available" \
+            --query "sort_by(Images,&CreationDate)[-1].ImageId" --output text)
+          echo "debian-12=$deb12" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved AMIs: ubuntu-22.04=$u22  ubuntu-24.04=$u24  debian-12=$deb12"
+
+  # ── Matrix: distro × cluster type ─────────────────────────────────────────────
+  ec2-test:
+    name: ${{ matrix.cluster }} on ${{ matrix.distro }}
+    needs: [build, resolve-amis]
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false   # let other cells finish even if one fails
+      matrix:
+        include:
+          # k3s cells
+          - distro: ubuntu-22.04
+            cluster: k3s
+            ami_key: ubuntu-2204
+            ssh_user: ubuntu
+          - distro: ubuntu-24.04
+            cluster: k3s
+            ami_key: ubuntu-2404
+            ssh_user: ubuntu
+          - distro: debian-12
+            cluster: k3s
+            ami_key: debian-12
+            ssh_user: admin
+          # kubeadm cells
+          - distro: ubuntu-22.04
+            cluster: kubeadm
+            ami_key: ubuntu-2204
+            ssh_user: ubuntu
+          - distro: ubuntu-24.04
+            cluster: kubeadm
+            ami_key: ubuntu-2404
+            ssh_user: ubuntu
+          - distro: debian-12
+            cluster: kubeadm
+            ami_key: debian-12
+            ssh_user: admin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: k3s-to-talos-binary
+      - run: chmod +x k3s-to-talos
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Generate an ephemeral SSH key pair ──────────────────────────────────
+      - name: Generate SSH key pair
+        run: |
+          ssh-keygen -t ed25519 -f "$HOME/.ssh/ci_key" -N "" -q
+          echo "SSH_PUB_KEY=$(cat $HOME/.ssh/ci_key.pub)" >> "$GITHUB_ENV"
+
+      # ── Build and upload user-data (inject public key) ──────────────────────
+      - name: Prepare user-data script
+        run: |
+          script=".github/scripts/user-data-${{ matrix.cluster }}.sh"
+          sed "s|__SSH_PUBLIC_KEY__|${SSH_PUB_KEY}|g" "$script" > /tmp/user-data.sh
+          cat /tmp/user-data.sh   # visible in logs for debugging
+
+      # ── Resolve the AMI ID for this matrix cell ─────────────────────────────
+      - name: Set AMI ID
+        run: |
+          case "${{ matrix.ami_key }}" in
+            ubuntu-2204) echo "AMI_ID=${{ needs.resolve-amis.outputs.ubuntu-2204 }}" >> "$GITHUB_ENV" ;;
+            ubuntu-2404) echo "AMI_ID=${{ needs.resolve-amis.outputs.ubuntu-2404 }}" >> "$GITHUB_ENV" ;;
+            debian-12)   echo "AMI_ID=${{ needs.resolve-amis.outputs.debian-12   }}" >> "$GITHUB_ENV" ;;
+          esac
+
+      # ── Create a per-run security group (SSH from anywhere) ──────────────────
+      - name: Create security group
+        id: sg
+        run: |
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "k3s-to-talos-ci-${{ github.run_id }}-${{ strategy.job-index }}" \
+            --description "Temporary CI SG for k3s-to-talos run ${{ github.run_id }}" \
+            --vpc-id "${{ secrets.AWS_VPC_ID }}" \
+            --query 'GroupId' --output text)
+
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0
+
+          echo "sg-id=$SG_ID" >> "$GITHUB_OUTPUT"
+
+      # ── Launch EC2 instance ──────────────────────────────────────────────────
+      - name: Launch EC2 instance
+        id: ec2
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "$AMI_ID" \
+            --instance-type "${{ env.INSTANCE_TYPE }}" \
+            --subnet-id "${{ secrets.AWS_SUBNET_ID }}" \
+            --security-group-ids "${{ steps.sg.outputs.sg-id }}" \
+            --user-data file:///tmp/user-data.sh \
+            --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":20,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+            --tag-specifications \
+              "ResourceType=instance,Tags=[{Key=Name,Value=k3s-to-talos-ci},{Key=GHRunId,Value=${{ github.run_id }}}]" \
+            --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
+            --query 'Instances[0].InstanceId' --output text)
+
+          echo "instance-id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "Launched: $INSTANCE_ID"
+
+      # ── Wait for the instance and SSH to be ready ────────────────────────────
+      - name: Wait for instance running
+        run: |
+          aws ec2 wait instance-running \
+            --instance-ids "${{ steps.ec2.outputs.instance-id }}"
+
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2.outputs.instance-id }}" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+
+          echo "INSTANCE_IP=$PUBLIC_IP" >> "$GITHUB_ENV"
+          echo "Instance IP: $PUBLIC_IP"
+
+      - name: Wait for SSH to become available
+        run: |
+          echo "Waiting for SSH on $INSTANCE_IP..."
+          for i in $(seq 1 40); do
+            if ssh -i "$HOME/.ssh/ci_key" \
+                   -o StrictHostKeyChecking=no \
+                   -o UserKnownHostsFile=/dev/null \
+                   -o ConnectTimeout=5 \
+                   "${{ matrix.ssh_user }}@$INSTANCE_IP" "exit 0" 2>/dev/null; then
+              echo "SSH ready after $((i*5))s"
+              break
+            fi
+            [ "$i" -eq 40 ] && { echo "SSH timeout"; exit 1; }
+            sleep 5
+          done
+
+      - name: Wait for cloud-init to complete
+        run: |
+          # cloud-init runs user-data asynchronously; wait for it to finish
+          # installing k3s/kubeadm before running our tool.
+          ssh -i "$HOME/.ssh/ci_key" \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              "${{ matrix.ssh_user }}@$INSTANCE_IP" \
+              "sudo cloud-init status --wait --long" 2>&1 || true
+
+          # Verify root SSH works (user-data should have set it up).
+          ssh -i "$HOME/.ssh/ci_key" \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              "root@$INSTANCE_IP" "echo root-ssh-ok"
+
+      # ── Run k3s-to-talos collect ─────────────────────────────────────────────
+      - name: Run collect
+        run: |
+          ./k3s-to-talos collect \
+            --host "$INSTANCE_IP" \
+            --ssh-user root \
+            --ssh-key "$HOME/.ssh/ci_key" \
+            --backup-dir ./test-backup
+
+      # ── Assert backup contents ───────────────────────────────────────────────
+      - name: Assert backup artefacts
+        run: |
+          echo "=== Backup contents ==="
+          find test-backup -type f | sort
+
+          echo "=== Assertions ==="
+          test -f test-backup/k3s.yaml            && echo "✓ kubeconfig"
+          test -f test-backup/database/backup-info.json && echo "✓ db backup metadata"
+
+          grep -q "cluster_type" test-backup/migration-state.json 2>/dev/null || true
+
+          resource_count=$(find test-backup/resources -name "*.yaml" 2>/dev/null | wc -l)
+          echo "  Exported resource files: $resource_count"
+          test "$resource_count" -gt 0 && echo "✓ resources exported"
+
+          db_type=$(jq -r .type test-backup/database/backup-info.json 2>/dev/null)
+          echo "  Database type: $db_type"
+
+          case "${{ matrix.cluster }}" in
+            k3s)
+              test -f test-backup/database/state.db \
+                || test -f test-backup/database/etcd-snapshot.db \
+                && echo "✓ k3s database backup present"
+              ;;
+            kubeadm)
+              test -f test-backup/database/etcd-snapshot.db && echo "✓ etcd snapshot present"
+              ;;
+          esac
+
+          echo "All assertions passed."
+
+      # ── Upload backup as workflow artefact ───────────────────────────────────
+      - name: Upload backup artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-${{ matrix.cluster }}-${{ matrix.distro }}
+          path: test-backup/
+          retention-days: 3
+
+      # ── Always terminate and clean up ────────────────────────────────────────
+      - name: Terminate EC2 instance
+        if: always()
+        run: |
+          if [ -n "${{ steps.ec2.outputs.instance-id }}" ]; then
+            aws ec2 terminate-instances \
+              --instance-ids "${{ steps.ec2.outputs.instance-id }}"
+            echo "Termination requested for ${{ steps.ec2.outputs.instance-id }}"
+          fi
+
+      - name: Delete security group
+        if: always()
+        run: |
+          SG="${{ steps.sg.outputs.sg-id }}"
+          if [ -z "$SG" ]; then exit 0; fi
+
+          # Security group can't be deleted while the instance is still shutting down.
+          # Wait up to 90 s for the instance to be terminated.
+          for i in $(seq 1 18); do
+            STATE=$(aws ec2 describe-instances \
+              --instance-ids "${{ steps.ec2.outputs.instance-id }}" \
+              --query 'Reservations[0].Instances[0].State.Name' \
+              --output text 2>/dev/null || echo terminated)
+            [ "$STATE" = "terminated" ] && break
+            sleep 5
+          done
+
+          aws ec2 delete-security-group --group-id "$SG" 2>/dev/null || \
+            echo "SG $SG will be cleaned up by the cost-management policy."

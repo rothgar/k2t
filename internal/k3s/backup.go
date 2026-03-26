@@ -48,7 +48,7 @@ func (b *Backup) Run(info *ClusterInfo, dryRun bool) error {
 	}
 
 	if !dryRun {
-		if err := b.backupDatabase(info.DatastoreType, dbDir); err != nil {
+		if err := b.backupDatabase(info, dbDir); err != nil {
 			s.Stop()
 			fmt.Printf("\n  Warning: database backup failed: %v\n", err)
 		}
@@ -66,7 +66,7 @@ func (b *Backup) Run(info *ClusterInfo, dryRun bool) error {
 
 	kubeconfigPath := filepath.Join(b.backupDir, "k3s.yaml")
 	if !dryRun {
-		if err := b.downloadKubeconfig(kubeconfigPath); err != nil {
+		if err := b.downloadKubeconfig(info, kubeconfigPath); err != nil {
 			s.Stop()
 			fmt.Printf("\n  Warning: kubeconfig download failed: %v\n", err)
 		} else {
@@ -90,16 +90,19 @@ func (b *Backup) Run(info *ClusterInfo, dryRun bool) error {
 	return nil
 }
 
-func (b *Backup) backupDatabase(datastoreType, dbDir string) error {
-	switch datastoreType {
+func (b *Backup) backupDatabase(info *ClusterInfo, dbDir string) error {
+	if info.ClusterType == ClusterTypeKubeadm {
+		return b.backupKubeadmEtcd(dbDir)
+	}
+	switch info.DatastoreType {
 	case "etcd":
-		return b.backupEtcd(dbDir)
+		return b.backupK3sEtcd(dbDir)
 	default:
 		return b.backupSQLite(dbDir)
 	}
 }
 
-func (b *Backup) backupEtcd(dbDir string) error {
+func (b *Backup) backupK3sEtcd(dbDir string) error {
 	snapshotName := fmt.Sprintf("migration-backup-%d", time.Now().Unix())
 
 	// Trigger snapshot on remote
@@ -128,6 +131,58 @@ func (b *Backup) backupEtcd(dbDir string) error {
 		"local_path":    localPath,
 		"timestamp":     time.Now().Format(time.RFC3339),
 		"restore_note":  "To restore: use k3s server --cluster-reset --cluster-reset-restore-path=<snapshot>",
+	}
+	if data, err := json.MarshalIndent(meta, "", "  "); err == nil {
+		os.WriteFile(filepath.Join(dbDir, "backup-info.json"), data, 0600) //nolint:errcheck
+	}
+
+	return nil
+}
+
+// backupKubeadmEtcd takes an etcd snapshot from a kubeadm-managed cluster by
+// running etcdctl inside the etcd static pod (which has access to all certs and
+// the /var/lib/etcd host-mounted volume).
+func (b *Backup) backupKubeadmEtcd(dbDir string) error {
+	kubectl := "kubectl --kubeconfig /etc/kubernetes/admin.conf"
+	snapshotHostPath := "/var/lib/etcd/migration-backup.db"
+
+	// Find the etcd pod name.
+	etcdPod, err := b.ssh.Run(
+		kubectl + " get pods -n kube-system -l component=etcd -o name 2>/dev/null" +
+			" | head -1 | cut -d'/' -f2")
+	if err != nil || strings.TrimSpace(etcdPod) == "" {
+		return fmt.Errorf("finding etcd pod (is the API server running?): %w", err)
+	}
+	etcdPod = strings.TrimSpace(etcdPod)
+
+	// Run etcdctl inside the etcd container. The container has /var/lib/etcd
+	// mounted from the host, so writing there makes the file accessible on disk.
+	cmd := fmt.Sprintf(
+		"%s exec -n kube-system %s -- etcdctl snapshot save %s"+
+			" --endpoints=https://127.0.0.1:2379"+
+			" --cacert=/etc/kubernetes/pki/etcd/ca.crt"+
+			" --cert=/etc/kubernetes/pki/etcd/server.crt"+
+			" --key=/etc/kubernetes/pki/etcd/server.key 2>&1",
+		kubectl, etcdPod, snapshotHostPath)
+
+	if out, err := b.ssh.Run(cmd); err != nil {
+		return fmt.Errorf("etcdctl snapshot save: %w (output: %s)", err, out)
+	}
+
+	localPath := filepath.Join(dbDir, "etcd-snapshot.db")
+	if err := b.ssh.Download(snapshotHostPath, localPath); err != nil {
+		return fmt.Errorf("downloading etcd snapshot: %w", err)
+	}
+	// Clean up the remote snapshot file.
+	b.ssh.RunIgnoreError(fmt.Sprintf("rm -f %s", snapshotHostPath))
+
+	meta := map[string]string{
+		"type":         "etcd",
+		"source":       "kubeadm",
+		"etcd_pod":     etcdPod,
+		"local_path":   localPath,
+		"timestamp":    time.Now().Format(time.RFC3339),
+		"restore_note": "To restore: kubeadm init phase etcd local --restore-dir=<snapshot>",
 	}
 	if data, err := json.MarshalIndent(meta, "", "  "); err == nil {
 		os.WriteFile(filepath.Join(dbDir, "backup-info.json"), data, 0600) //nolint:errcheck
@@ -169,8 +224,12 @@ func (b *Backup) backupSQLite(dbDir string) error {
 	return nil
 }
 
-func (b *Backup) downloadKubeconfig(localPath string) error {
-	if err := b.ssh.Download("/etc/rancher/k3s/k3s.yaml", localPath); err != nil {
+func (b *Backup) downloadKubeconfig(info *ClusterInfo, localPath string) error {
+	remotePath := "/etc/rancher/k3s/k3s.yaml"
+	if info.ClusterType == ClusterTypeKubeadm {
+		remotePath = "/etc/kubernetes/admin.conf"
+	}
+	if err := b.ssh.Download(remotePath, localPath); err != nil {
 		return err
 	}
 

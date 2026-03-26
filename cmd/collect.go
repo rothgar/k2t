@@ -44,7 +44,10 @@ func runCollect(cmd *cobra.Command, args []string) error {
 	}
 	defer sshClient.Close()
 
-	collector := k3s.NewCollector(sshClient)
+	collector, err := k3s.Detect(sshClient)
+	if err != nil {
+		return fmt.Errorf("detecting cluster type: %w", err)
+	}
 	info, err := collector.Collect()
 	if err != nil {
 		return fmt.Errorf("collecting k3s info: %w", err)
