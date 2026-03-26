@@ -170,13 +170,27 @@ func detectBootDisk() (string, error) {
 
 // ── Tool installation ────────────────────────────────────────────────────────
 
+// toolPackages maps binary names to the apt package that provides them.
+// Several binaries have a different name from their package (e.g. the kexec
+// binary lives in the kexec-tools package).
+var toolPackages = map[string]string{
+	"kexec":      "kexec-tools",
+	"efibootmgr": "efibootmgr",
+	"zstd":       "zstd",
+	"xz":         "xz-utils",
+}
+
 func ensureTool(name string) error {
 	if _, err := exec.LookPath(name); err == nil {
 		return nil
 	}
-	log("%s not found — installing via apt-get...", name)
-	if out, err := exec.Command("apt-get", "install", "-y", "-q", name).CombinedOutput(); err != nil {
-		return fmt.Errorf("installing %s: %w\n%s", name, err, string(out))
+	pkg := name
+	if p, ok := toolPackages[name]; ok {
+		pkg = p
+	}
+	log("%s not found — installing package %s via apt-get...", name, pkg)
+	if out, err := exec.Command("apt-get", "install", "-y", "-q", pkg).CombinedOutput(); err != nil {
+		return fmt.Errorf("installing %s (package %s): %w\n%s", name, pkg, err, string(out))
 	}
 	return nil
 }
