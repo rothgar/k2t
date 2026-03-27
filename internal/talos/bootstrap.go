@@ -74,7 +74,7 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 	// server is up, the cert was generated from the config CA, and talosctl
 	// can authenticate.  A short sleep first gives apply-config time to
 	// trigger a reboot if the node was in maintenance mode.
-	fmt.Println("  Waiting for Talos gRPC API to be ready (up to 20 minutes)...")
+	fmt.Println("  Waiting for Talos gRPC API to be ready (up to 35 minutes)...")
 	time.Sleep(5 * time.Second)
 	if err := b.waitForTalosctlReady(talosctlPath, opts.TalosConfigFile, opts.Host); err != nil {
 		return fmt.Errorf("waiting for Talos after config apply: %w", err)

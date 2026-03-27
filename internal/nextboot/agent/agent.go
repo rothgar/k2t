@@ -390,9 +390,27 @@ func writeConfig(disk string, config []byte) error {
 	}
 	defer cleanup()
 
-	// Log the filesystem type on the loop device for diagnostics.
-	if out, err := exec.Command("blkid", "-o", "value", "-s", "TYPE", loopDev).Output(); err == nil {
-		log("STATE partition filesystem type: %s", strings.TrimSpace(string(out)))
+	// Check whether the STATE partition is already formatted.
+	// The Talos metal RAW image may ship with an unformatted STATE partition
+	// (Talos formats it on first installation).  If unformatted, create the
+	// XFS filesystem ourselves so we can write the config now and avoid
+	// the maintenance-mode → hardware-reboot cycle entirely.
+	blkidOut, _ := exec.Command("blkid", "-o", "value", "-s", "TYPE", loopDev).Output()
+	fsType := strings.TrimSpace(string(blkidOut))
+	if fsType == "" {
+		log("STATE partition is unformatted — creating XFS filesystem (label STATEPART)...")
+		// Ensure mkfs.xfs is available.
+		if _, lookErr := exec.LookPath("mkfs.xfs"); lookErr != nil {
+			if out2, aptErr := exec.Command("apt-get", "install", "-y", "-q", "xfsprogs").CombinedOutput(); aptErr != nil {
+				return fmt.Errorf("installing xfsprogs for mkfs.xfs: %w\n%s", aptErr, string(out2))
+			}
+		}
+		if out2, fmtErr := exec.Command("mkfs.xfs", "-L", "STATEPART", "-f", loopDev).CombinedOutput(); fmtErr != nil {
+			return fmt.Errorf("mkfs.xfs for STATE partition: %w\n%s", fmtErr, string(out2))
+		}
+		log("STATE partition formatted as XFS (label=STATEPART).")
+	} else {
+		log("STATE partition filesystem type: %s", fsType)
 	}
 
 	mountPoint, err := os.MkdirTemp("", "talos-state-*")
