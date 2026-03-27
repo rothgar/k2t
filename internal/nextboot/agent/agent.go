@@ -739,7 +739,17 @@ func prepareKexec(imageURL string, configData []byte) error {
 	// EC2 when the original Ubuntu NVRAM entries reference a now-replaced EFI
 	// partition GUID.
 
-	// Log the hypervisor/vendor for diagnostics.
+	// Log the hypervisor/vendor for diagnostics, and skip kexec on EC2.
+	//
+	// AWS EC2 Nitro instances use the ENA (Elastic Network Adapter) driver.
+	// In practice, after kexec -e, the ENA driver in the new Talos kernel
+	// fails to establish networking: the device never becomes ready despite
+	// ena_device_reset() being called.  The root cause is likely the ENA
+	// firmware state machine requiring a full PCI power cycle (which only a
+	// hardware reboot provides) to reset properly.
+	//
+	// Fall back to hardware reboot on EC2 so that the EFI boot path
+	// (systemd-boot → Talos UKI) is used instead of kexec.
 	for _, dmiPath := range []string{
 		"/sys/class/dmi/id/sys_vendor",
 		"/sys/class/dmi/id/board_vendor",
@@ -749,6 +759,14 @@ func prepareKexec(imageURL string, configData []byte) error {
 			v := strings.TrimSpace(string(data))
 			if v != "" {
 				log("DMI %s = %q", dmiPath[len("/sys/class/dmi/id/"):], v)
+				if strings.Contains(v, "Amazon") || strings.Contains(v, "amazon") {
+					return fmt.Errorf(
+						"EC2 Nitro detected (%q): skipping kexec — " +
+							"ENA NIC requires a full hardware reboot to re-initialise; " +
+							"will use UEFI hardware reboot instead",
+						v,
+					)
+				}
 				break
 			}
 		}
@@ -1167,57 +1185,19 @@ func updateUEFIBoot(disk string) error {
 		log("NVRAM before efibootmgr changes:\n%s", strings.TrimSpace(string(out)))
 	}
 
-	// Talos always places its GRUB EFI binary on partition 1 of the metal image.
-	// We construct the DevicePath pointing to it and store it in NVRAM.
-	out, err := exec.Command("efibootmgr",
-		"--create",
-		"--disk", disk,
-		"--part", "1",
-		"--label", "Talos",
-		"--loader", `\EFI\BOOT\BOOTX64.EFI`,
-	).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("efibootmgr --create: %w\n%s", err, string(out))
-	}
-
-	// Parse the new entry number from output lines like "Boot000X* Talos"
-	re := regexp.MustCompile(`Boot([0-9A-Fa-f]{4})\*?\s+Talos`)
-	match := re.FindSubmatch(out)
-	if match == nil {
-		return fmt.Errorf("could not find new Talos boot entry in efibootmgr output:\n%s", string(out))
-	}
-	bootNum := string(match[1])
-	log("Created UEFI boot entry Boot%s for Talos.", bootNum)
-
-	// Set BootNext so this entry is used on the very next boot (one-shot).
-	if out2, err := exec.Command("efibootmgr", "--bootnext", bootNum).CombinedOutput(); err != nil {
-		return fmt.Errorf("efibootmgr --bootnext %s: %w\n%s", bootNum, err, string(out2))
-	}
-	log("UEFI BootNext → Boot%s (Talos will boot on the next restart).", bootNum)
-
-	// Set BootOrder to contain ONLY our Talos entry.  This prevents the
-	// firmware from trying the old Ubuntu entry (which references the
-	// pre-migration EFI partition GUID and will always fail) or a PXE/LAN
-	// boot entry (which wastes several minutes timing out) before reaching
-	// Talos.  After BootNext is consumed on the first boot, subsequent
-	// hardware reboots also go directly to Talos.
-	if out3, err := exec.Command("efibootmgr", "--bootorder", bootNum).CombinedOutput(); err != nil {
-		log("Warning: could not set BootOrder: %v (%s)", err, strings.TrimSpace(string(out3)))
-	} else {
-		log("UEFI BootOrder set to Boot%s only (Talos).", bootNum)
-	}
-
-	// Delete all other boot entries so the firmware never falls back to the
-	// stale Ubuntu or PXE entries.  This is a best-effort cleanup; failures
-	// are non-fatal because BootNext + BootOrder above already direct the
-	// firmware to Talos.
+	// ── Step 1: Delete ALL existing boot entries first ────────────────────────
+	//
+	// We MUST do this before attempting to create the Talos entry.  If we
+	// created first and deletion is skipped on error, stale Ubuntu/PXE entries
+	// remain in NVRAM and the firmware tries them before reaching the UEFI
+	// fallback path (\EFI\BOOT\BOOTX64.EFI).
+	//
+	// By deleting everything first, we guarantee that even if --create fails,
+	// the next reboot uses the UEFI fallback path → systemd-boot → Talos UKI.
 	if allOut, err := exec.Command("efibootmgr").CombinedOutput(); err == nil {
 		entryRe := regexp.MustCompile(`(?m)^Boot([0-9A-Fa-f]{4})[* ]`)
-		for _, match := range entryRe.FindAllSubmatch(allOut, -1) {
-			num := string(match[1])
-			if strings.EqualFold(num, bootNum) {
-				continue // keep our Talos entry
-			}
+		for _, m := range entryRe.FindAllSubmatch(allOut, -1) {
+			num := string(m[1])
 			if delOut, delErr := exec.Command("efibootmgr",
 				"--delete-bootnum", "--bootnum", num,
 			).CombinedOutput(); delErr != nil {
@@ -1226,6 +1206,53 @@ func updateUEFIBoot(disk string) error {
 				log("Deleted stale boot entry Boot%s.", num)
 			}
 		}
+	}
+
+	// ── Step 2: Create the Talos boot entry ──────────────────────────────────
+	//
+	// Talos v1.12+ uses systemd-boot.  The fallback EFI binary is placed at
+	// \EFI\BOOT\BOOTX64.EFI on partition 1 of the metal image.
+	out, err := exec.Command("efibootmgr",
+		"--create",
+		"--disk", disk,
+		"--part", "1",
+		"--label", "Talos",
+		"--loader", `\EFI\BOOT\BOOTX64.EFI`,
+	).CombinedOutput()
+	if err != nil {
+		// All stale entries are already gone (Step 1), so the UEFI fallback
+		// (\EFI\BOOT\BOOTX64.EFI) will still be used on next boot even without
+		// an explicit NVRAM entry.  Log and return; this is non-fatal.
+		log("Warning: efibootmgr --create failed (%v); UEFI fallback path will be used: %s", err, strings.TrimSpace(string(out)))
+		return nil
+	}
+
+	// Parse the new entry number from output lines like "Boot000X* Talos"
+	re := regexp.MustCompile(`Boot([0-9A-Fa-f]{4})\*?\s+Talos`)
+	match := re.FindSubmatch(out)
+	if match == nil {
+		log("Warning: could not parse Talos boot entry number from efibootmgr output; UEFI fallback will be used:\n%s", string(out))
+		return nil
+	}
+	bootNum := string(match[1])
+	log("Created UEFI boot entry Boot%s for Talos.", bootNum)
+
+	// ── Step 3: Point BootNext + BootOrder at the new entry ──────────────────
+
+	// Set BootNext so this entry is used on the very next boot (one-shot).
+	if out2, err := exec.Command("efibootmgr", "--bootnext", bootNum).CombinedOutput(); err != nil {
+		log("Warning: efibootmgr --bootnext %s: %v (%s)", bootNum, err, strings.TrimSpace(string(out2)))
+	} else {
+		log("UEFI BootNext → Boot%s (Talos will boot on the next restart).", bootNum)
+	}
+
+	// Set BootOrder to contain ONLY our Talos entry.  After BootNext is
+	// consumed on the first boot, subsequent hardware reboots also go directly
+	// to Talos.
+	if out3, err := exec.Command("efibootmgr", "--bootorder", bootNum).CombinedOutput(); err != nil {
+		log("Warning: could not set BootOrder: %v (%s)", err, strings.TrimSpace(string(out3)))
+	} else {
+		log("UEFI BootOrder set to Boot%s only (Talos).", bootNum)
 	}
 
 	// Log NVRAM state after changes for diagnostics.
