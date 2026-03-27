@@ -690,7 +690,10 @@ func prepareKexec(imageURL string, configData []byte) error {
 		}
 	}
 
-	log("kexec cmdline (%d chars, first 200 shown): %.200s", len(cmdLine), cmdLine)
+	// Log the full cmdline.  This is important for diagnosing talos.config.inline
+	// issues — the CI artifacts contain this log so we can verify the inline
+	// config was embedded correctly.
+	log("kexec cmdline (%d chars): %s", len(cmdLine), cmdLine)
 
 	log("Loading Talos kernel into RAM via kexec -l ...")
 	if out, err := exec.Command("kexec",
