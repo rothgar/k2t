@@ -4,7 +4,9 @@
 package agent
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -69,8 +71,22 @@ func Run(opts Options) error {
 	// If kexec is unavailable or blocked (kernel lockdown / Secure Boot),
 	// prepareKexec returns an error and we fall back to a hardware reboot
 	// using the EFI file patch + BootNext mechanism below.
+	//
+	// Read the machine config now (before disk write) so we can embed it
+	// directly in the kexec cmdline via talos.config.inline.  This makes
+	// the kexec-booted Talos start in configured mode rather than maintenance
+	// mode, avoiding the apply-config → hardware-reboot cycle entirely.
+	var kexecConfigData []byte
+	if opts.Config != "" {
+		if data, err := os.ReadFile(opts.Config); err == nil {
+			kexecConfigData = data
+			log("Machine config read (%d bytes) — will embed in kexec cmdline.", len(data))
+		} else {
+			log("Warning: could not read config for kexec inline: %v", err)
+		}
+	}
 	kexecLoaded := false
-	if kexecErr := prepareKexec(opts.ImageURL); kexecErr != nil {
+	if kexecErr := prepareKexec(opts.ImageURL, kexecConfigData); kexecErr != nil {
 		log("kexec pre-load skipped: %v", kexecErr)
 		log("Will use hardware reboot (EFI file patch + BootNext) instead.")
 	} else {
@@ -542,7 +558,24 @@ func losetupStatePartition(disk string) (loopDev string, cleanup func(), err err
 // system is fully intact (Ubuntu running), so there are no stale partition
 // caches or other post-dd races.  If loading fails (Secure Boot / lockdown)
 // we know before the disk is overwritten and can prepare EFI fallback paths.
-func prepareKexec(imageURL string) error {
+// compressZstd compresses data using the zstd binary.
+// This is used to embed the machine config in the kexec cmdline via
+// talos.config.inline, which requires zstd-compressed, base64-encoded data.
+func compressZstd(data []byte) ([]byte, error) {
+	// Ensure zstd is available (may not be installed yet at this stage).
+	if err := ensureTool("zstd"); err != nil {
+		return nil, fmt.Errorf("ensuring zstd: %w", err)
+	}
+	cmd := exec.Command("zstd", "-q", "-", "-c")
+	cmd.Stdin = bytes.NewReader(data)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("zstd compress: %w", err)
+	}
+	return out, nil
+}
+
+func prepareKexec(imageURL string, configData []byte) error {
 	// Check for kernel lockdown — kexec_load is blocked when lockdown is
 	// active (e.g. with Secure Boot on Ubuntu).  Skip early to avoid
 	// downloading several hundred MB only to fail.
@@ -621,7 +654,25 @@ func prepareKexec(imageURL string) error {
 	cmdLine := "console=tty0 console=ttyS0,115200 talos.platform=metal " +
 		"net.ifnames=0 init_on_alloc=1 slab_nomerge pti=on " +
 		"consoleblank=0 random.trust_cpu=on printk.devkmsg=on"
-	log("kexec cmdline: %s", cmdLine)
+
+	// Embed the machine config inline in the kexec cmdline when available.
+	// talos.config.inline accepts a zstd-compressed, base64-encoded machine
+	// config.  This causes Talos to start in configured mode rather than
+	// maintenance mode, completely bypassing the apply-config → hardware-
+	// reboot cycle that causes the CI timeout.
+	if len(configData) > 0 {
+		compressed, err := compressZstd(configData)
+		if err != nil {
+			log("Warning: could not compress config for inline embed: %v — Talos will use STATE partition or maintenance mode", err)
+		} else {
+			encoded := base64.StdEncoding.EncodeToString(compressed)
+			cmdLine += " talos.config.inline=" + encoded
+			log("Machine config embedded in kexec cmdline via talos.config.inline (%d bytes → %d bytes compressed → %d chars base64)",
+				len(configData), len(compressed), len(encoded))
+		}
+	}
+
+	log("kexec cmdline (first 200 chars): %.200s", cmdLine)
 
 	log("Loading Talos kernel into RAM via kexec -l ...")
 	if out, err := exec.Command("kexec",
