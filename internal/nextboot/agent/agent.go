@@ -138,6 +138,21 @@ func Run(opts Options) error {
 		log("Warning: could not drop page cache (%v); stale reads possible.", err)
 	}
 
+	// Relocate the backup GPT header to the end of the disk.  The Talos
+	// metal raw image was designed for a ~200 MB disk; when written to a
+	// larger EC2 volume (e.g. 20 GiB) the backup GPT lands at sector ~400k
+	// instead of the last sector.  sgdisk -e moves it to the correct
+	// position so that tools and VolumeManagerController see the full
+	// available space for new partitions (STATE, EPHEMERAL).
+	if err := ensureTool("sgdisk"); err != nil {
+		log("Warning: could not install sgdisk (gdisk): %v — GPT backup relocation skipped", err)
+	}
+	if out, err := exec.Command("sgdisk", "-e", disk).CombinedOutput(); err != nil {
+		log("sgdisk -e (relocate backup GPT) warning: %v (%s) — continuing", err, strings.TrimSpace(string(out)))
+	} else {
+		log("sgdisk -e: backup GPT relocated to end of disk.")
+	}
+
 	// Refresh the kernel's view of the new partition table.  On a live disk
 	// (root fs mounted on p2) partprobe/BLKRRPART will report EBUSY for
 	// partition 2 but still update the unmounted partitions (EFI, STATE).
@@ -158,6 +173,16 @@ func Run(opts Options) error {
 	// Log disk layout after partition refresh for diagnostics.
 	if out, err := exec.Command("lsblk", "-o", "NAME,SIZE,TYPE,MOUNTPOINT", disk).CombinedOutput(); err == nil {
 		log("Disk layout after partition refresh:\n%s", strings.TrimSpace(string(out)))
+	}
+
+	// Pre-create the STATE partition if the Talos metal raw image did not
+	// include one.  VolumeManagerController will create STATE on first Talos
+	// boot, but pre-creating it here lets writeConfig write the machine
+	// config to it directly, which avoids the maintenance-mode →
+	// apply-config → SequenceBoot cycle that causes the CI timeout.
+	if err := ensureStatePartition(disk); err != nil {
+		log("Warning: could not pre-create STATE partition: %v", err)
+		log("Talos VolumeManagerController will create STATE on first boot.")
 	}
 
 	// ── 4. Ensure hardware reboot boots Talos — two complementary mechanisms ──
@@ -255,6 +280,7 @@ func detectBootDisk() (string, error) {
 var toolPackages = map[string]string{
 	"kexec":      "kexec-tools",
 	"efibootmgr": "efibootmgr",
+	"sgdisk":     "gdisk",
 	"zstd":       "zstd",
 	"xz":         "xz-utils",
 }
@@ -490,6 +516,83 @@ func writeConfig(disk string, config []byte) error {
 // this function returns an error and writeConfig gracefully skips the STATE
 // write — Talos will use the talos.config.inline kexec cmdline parameter
 // (embedded by prepareKexec) to deliver the machine config on first boot.
+// ensureStatePartition creates a Talos STATE partition on disk if one does
+// not already exist.  The factory.talos.dev metal raw image ships with only
+// 3-4 partitions (EFI, BIOS, META/BOOT variants); STATE and EPHEMERAL are
+// created by VolumeManagerController on first boot.  Pre-creating STATE here
+// lets writeConfig embed the machine config directly, eliminating the
+// maintenance-mode → apply-config → SequenceBoot cycle that causes timeouts.
+//
+// The partition is created with GPT label "STATE" using sgdisk.  A 512 MiB
+// size is sufficient to hold config.yaml and matches what Talos allocates for
+// STATE in its standard layout.  VolumeManagerController will resize it later
+// if needed.
+func ensureStatePartition(disk string) error {
+	// Check if STATE already exists.
+	sfdiskOut, err := exec.Command("sfdisk", "--json", disk).Output()
+	if err != nil {
+		return fmt.Errorf("sfdisk --json %s: %w", disk, err)
+	}
+	var pt struct {
+		PartitionTable struct {
+			Partitions []struct {
+				Name string `json:"name"`
+			} `json:"partitions"`
+		} `json:"partitiontable"`
+	}
+	if err := json.Unmarshal(sfdiskOut, &pt); err != nil {
+		return fmt.Errorf("parsing sfdisk output: %w", err)
+	}
+	for _, p := range pt.PartitionTable.Partitions {
+		if strings.EqualFold(p.Name, "STATE") {
+			log("STATE partition already exists — skipping creation.")
+			return nil
+		}
+	}
+
+	log("STATE partition not found in GPT (%d existing partitions) — creating it with sgdisk...",
+		len(pt.PartitionTable.Partitions))
+
+	// Create a new 512 MiB partition with GPT label "STATE" and Linux
+	// filesystem type UUID.  sgdisk partition number 0 means "next available".
+	out, err := exec.Command("sgdisk",
+		"-n", "0:0:+512M",                      // next partnum, auto start, +512M
+		"-t", "0:0FC63DAF-8483-4772-8E79-3D69D8477DE4", // Linux filesystem type
+		"-c", "0:STATE",                         // GPT label
+		disk,
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("sgdisk create STATE partition: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	log("sgdisk created STATE partition: %s", strings.TrimSpace(string(out)))
+
+	// Refresh the kernel partition table so the new device node appears.
+	exec.Command("partx", "-u", disk).Run() //nolint:errcheck
+	exec.Command("udevadm", "settle", "--timeout=5").Run() //nolint:errcheck
+	time.Sleep(1 * time.Second)
+
+	// Verify the partition now appears in the GPT.
+	if verifyOut, err := exec.Command("sfdisk", "--json", disk).Output(); err == nil {
+		var pt2 struct {
+			PartitionTable struct {
+				Partitions []struct {
+					Node string `json:"node"`
+					Name string `json:"name"`
+				} `json:"partitions"`
+			} `json:"partitiontable"`
+		}
+		if json.Unmarshal(verifyOut, &pt2) == nil {
+			for _, p := range pt2.PartitionTable.Partitions {
+				if strings.EqualFold(p.Name, "STATE") {
+					log("STATE partition created successfully: %s", p.Node)
+					return nil
+				}
+			}
+		}
+	}
+	return fmt.Errorf("STATE partition creation failed: partition not found in GPT after sgdisk")
+}
+
 func losetupStatePartition(disk string) (loopDev string, cleanup func(), err error) {
 	cleanup = func() {}
 

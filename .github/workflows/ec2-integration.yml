@@ -203,6 +203,10 @@ jobs:
       #      retrieves kubeconfig
       - name: Run k3s-to-talos migrate
         run: |
+          mkdir -p test-backup
+          # Tee all output to a log file so the backup artifact captures it.
+          # pipefail ensures the exit code comes from migrate, not tee.
+          set -o pipefail
           ./k3s-to-talos migrate \
             --host "$NODE_IP" \
             --ssh-user ubuntu \
@@ -211,7 +215,8 @@ jobs:
             --talos-version "${{ env.TALOS_VERSION }}" \
             --cluster-name "ci-migration-test" \
             --yes \
-            --backup-dir ./test-backup
+            --backup-dir ./test-backup \
+          2>&1 | tee test-backup/migrate.log
 
       # ── Verify workload survived the migration ────────────────────────────
       - name: Verify ci-test-nginx deployment on Talos
