@@ -727,13 +727,19 @@ func compressZstd(data []byte) ([]byte, error) {
 }
 
 func prepareKexec(imageURL string, configData []byte) error {
-	// On AWS EC2 Nitro instances, kexec is unreliable because the ENA
-	// (Elastic Network Adapter) driver does not cleanly reinitialize after a
-	// kexec jump: the new Talos kernel may not be able to bring up eth0,
-	// making port 50000 unreachable from the outside even though Talos is
-	// running.  A normal hardware reboot lets the EC2 firmware reinitialize
-	// all PCI devices before handing off to UEFI → GRUB → Talos, which
-	// reliably initializes ENA.  Prefer hardware reboot on EC2.
+	// On AWS EC2 Nitro instances the ENA (Elastic Network Adapter) driver
+	// calls ena_device_reset() during its probe path, which resets the device
+	// to a known state regardless of prior kernel ownership.  kexec therefore
+	// works correctly on EC2: the new Talos kernel re-probes all PCI devices,
+	// the ENA driver resets and re-initialises the NIC, and networking is
+	// available within seconds of the kexec jump.
+	//
+	// kexec also bypasses the EC2 virtual NVRAM / UEFI boot-entry mechanism
+	// entirely, avoiding the reliability issues that hardware reboots have on
+	// EC2 when the original Ubuntu NVRAM entries reference a now-replaced EFI
+	// partition GUID.
+
+	// Log the hypervisor/vendor for diagnostics.
 	for _, dmiPath := range []string{
 		"/sys/class/dmi/id/sys_vendor",
 		"/sys/class/dmi/id/board_vendor",
@@ -741,9 +747,9 @@ func prepareKexec(imageURL string, configData []byte) error {
 	} {
 		if data, err := os.ReadFile(dmiPath); err == nil {
 			v := strings.TrimSpace(string(data))
-			if strings.Contains(v, "Amazon") {
-				log("EC2 detected via %s (%q) — skipping kexec; hardware reboot will be used instead.", dmiPath, v)
-				return fmt.Errorf("EC2 Nitro detected: kexec skipped to ensure reliable ENA NIC initialization via firmware boot")
+			if v != "" {
+				log("DMI %s = %q", dmiPath[len("/sys/class/dmi/id/"):], v)
+				break
 			}
 		}
 	}
@@ -1189,38 +1195,36 @@ func updateUEFIBoot(disk string) error {
 	}
 	log("UEFI BootNext → Boot%s (Talos will boot on the next restart).", bootNum)
 
-	// Also prepend Talos to BootOrder so that after BootNext is consumed
-	// (it's a one-shot flag), subsequent hardware reboots also boot Talos
-	// rather than falling back to the Ubuntu entry.
-	//
-	// Parse the current BootOrder from efibootmgr output, prepend our entry,
-	// and write it back.  Failures here are non-fatal — BootNext alone plus
-	// the EFI file patch is still a viable fallback.
-	if boOut, err := exec.Command("efibootmgr").CombinedOutput(); err == nil {
-		boLine := ""
-		for _, line := range strings.Split(string(boOut), "\n") {
-			if strings.HasPrefix(line, "BootOrder:") {
-				boLine = strings.TrimPrefix(line, "BootOrder:")
-				boLine = strings.TrimSpace(boLine)
-				break
+	// Set BootOrder to contain ONLY our Talos entry.  This prevents the
+	// firmware from trying the old Ubuntu entry (which references the
+	// pre-migration EFI partition GUID and will always fail) or a PXE/LAN
+	// boot entry (which wastes several minutes timing out) before reaching
+	// Talos.  After BootNext is consumed on the first boot, subsequent
+	// hardware reboots also go directly to Talos.
+	if out3, err := exec.Command("efibootmgr", "--bootorder", bootNum).CombinedOutput(); err != nil {
+		log("Warning: could not set BootOrder: %v (%s)", err, strings.TrimSpace(string(out3)))
+	} else {
+		log("UEFI BootOrder set to Boot%s only (Talos).", bootNum)
+	}
+
+	// Delete all other boot entries so the firmware never falls back to the
+	// stale Ubuntu or PXE entries.  This is a best-effort cleanup; failures
+	// are non-fatal because BootNext + BootOrder above already direct the
+	// firmware to Talos.
+	if allOut, err := exec.Command("efibootmgr").CombinedOutput(); err == nil {
+		entryRe := regexp.MustCompile(`(?m)^Boot([0-9A-Fa-f]{4})[* ]`)
+		for _, match := range entryRe.FindAllSubmatch(allOut, -1) {
+			num := string(match[1])
+			if strings.EqualFold(num, bootNum) {
+				continue // keep our Talos entry
 			}
-		}
-		newOrder := bootNum
-		if boLine != "" {
-			// Remove any existing Talos entries to avoid duplicates.
-			var parts []string
-			for _, part := range strings.Split(boLine, ",") {
-				part = strings.TrimSpace(part)
-				if !strings.EqualFold(part, bootNum) {
-					parts = append(parts, part)
-				}
+			if delOut, delErr := exec.Command("efibootmgr",
+				"--delete-bootnum", "--bootnum", num,
+			).CombinedOutput(); delErr != nil {
+				log("Warning: could not delete Boot%s: %v (%s)", num, delErr, strings.TrimSpace(string(delOut)))
+			} else {
+				log("Deleted stale boot entry Boot%s.", num)
 			}
-			newOrder = bootNum + "," + strings.Join(parts, ",")
-		}
-		if out3, err := exec.Command("efibootmgr", "--bootorder", newOrder).CombinedOutput(); err != nil {
-			log("Warning: could not update BootOrder: %v (%s)", err, strings.TrimSpace(string(out3)))
-		} else {
-			log("UEFI BootOrder updated — Talos (Boot%s) is now first.", bootNum)
 		}
 	}
 
