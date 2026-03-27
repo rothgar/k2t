@@ -227,6 +227,20 @@ jobs:
             sleep 5
           done
 
+      # ── Capture EC2 serial console for post-mortem debugging ─────────────
+      # The serial console shows GRUB, kernel boot, and Talos startup logs,
+      # which is essential for diagnosing boot failures.  Note: console output
+      # is buffered by the hypervisor and may lag 1-2 minutes behind reality.
+      - name: Capture EC2 serial console output
+        if: always()
+        run: |
+          echo "=== EC2 Serial Console Output ==="
+          aws ec2 get-console-output \
+            --instance-id "${{ steps.ec2.outputs.instance-id }}" \
+            --latest \
+            --output text 2>/dev/null || echo "(no console output available yet)"
+          echo "=== End Serial Console ==="
+
       # ── Upload backup artefacts for debugging ─────────────────────────────
       - name: Upload backup artefact
         if: always()
