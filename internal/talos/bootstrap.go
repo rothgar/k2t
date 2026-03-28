@@ -373,6 +373,11 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 	// After sending apply-config, how long we wait for port DOWN before
 	// concluding the reboot didn't start and we should retry.
 	const waitForRebootTimeout = 2 * time.Minute
+	// If the CA-verified check keeps failing with a TLS cert error while port
+	// 50000 stays UP, the node is running Talos but with a self-signed cert
+	// (Talos v1.12+ workers do not include machine.ca.key so machined cannot
+	// issue CA-signed certs).  Accept the node as ready after this soak time.
+	const certErrorSoakTime = 5 * time.Minute
 
 	deadline := time.Now().Add(35 * time.Minute)
 	wait := 5 * time.Second
@@ -391,6 +396,11 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 	// Both-ports-down fail-fast tracking.
 	bothPortsDownSince := time.Time{}
 
+	// Cert-error soak tracking.  When the CA-verified check fails with a TLS
+	// cert error (not a connection error) while port 50000 stays UP, we track
+	// how long we've been in that state and declare ready after certErrorSoakTime.
+	certErrorSince := time.Time{}
+
 	for time.Now().Before(deadline) {
 		attempt++
 		elapsed := time.Since(start).Round(time.Second)
@@ -407,26 +417,40 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 			return nil
 		}
 
-		// Fallback: talosconfig+insecure.  Workers in Talos v1.12+ may have
-		// an empty machine.ca.key in their config, so machined generates a
-		// self-signed cert that the CA chain in talosconfig cannot verify.
-		// Using --insecure skips server-cert verification while still
-		// presenting the client cert (satisfies machined's mTLS requirement).
-		if talosConfigFile != "" {
-			if _, insecureErr := b.runTalosctlWithOutput(talosctlPath, talosConfigFile,
-				"version", "--insecure",
-				"--nodes", host,
-				"--endpoints", host,
-			); insecureErr == nil {
-				s.Stop()
-				color.Green("  ✓ Talos gRPC API is ready (talosconfig+insecure, elapsed %s)\n", elapsed)
-				return nil
-			}
-		}
-
 		// ── Port probes ───────────────────────────────────────────────────────
 		port50kUp := tcpProbe(host+":50000", 3*time.Second)
 		port22Up := tcpProbe(host+":22", 3*time.Second)
+
+		// ── Cert-error soak ───────────────────────────────────────────────────
+		// If the CA-verified check fails with a TLS cert error (not a connection-
+		// refused / timeout error) while port 50000 is UP, the node IS running
+		// Talos — it's just using a self-signed cert.  This happens on Talos
+		// v1.12+ workers where machine.ca.key is absent and machined cannot
+		// issue a CA-signed cert.
+		//
+		// In talosctl v1.12+ "--insecure" means "maintenance mode API" (no mTLS),
+		// not "skip TLS cert verification".  There is no talosctl flag to connect
+		// to a configured-mode node while skipping CA verification.
+		//
+		// Strategy: if the cert error persists for certErrorSoakTime while port
+		// 50000 stays UP, accept the node as ready.  The worker.yaml config was
+		// written to the STATE partition before the reboot, so the worker booted
+		// in configured mode and will join the cluster via the embedded token.
+		if port50kUp && isCertError(err) {
+			if certErrorSince.IsZero() {
+				certErrorSince = time.Now()
+			}
+			if time.Since(certErrorSince) >= certErrorSoakTime {
+				s.Stop()
+				color.Yellow("  ⚠ CA cert verification has failed for %s, but port 50000 "+
+					"has been UP — node is running Talos with a self-signed cert (elapsed %s)\n",
+					time.Since(certErrorSince).Round(time.Second), elapsed)
+				color.Yellow("  Treating as ready (worker joins cluster via embedded token)\n")
+				return nil
+			}
+		} else if !isCertError(err) {
+			certErrorSince = time.Time{} // reset if error type changed
+		}
 
 		// ── Track port-50000 transitions (detect reboots) ─────────────────────
 		justCameUp := port50kUp && !prevPort50kUp // captured before prevPort50kUp is updated
@@ -637,6 +661,19 @@ func tcpProbe(addr string, timeout time.Duration) bool {
 	}
 	conn.Close()
 	return true
+}
+
+// isCertError returns true if the error is a TLS certificate validation failure
+// (as opposed to a connection error or timeout).  A cert error means the remote
+// end IS up and responding — only the certificate verification failed.
+func isCertError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "x509") ||
+		strings.Contains(msg, "certificate") ||
+		strings.Contains(msg, "tls: ")
 }
 
 // summariseError returns a compact one-line representation of the error.
