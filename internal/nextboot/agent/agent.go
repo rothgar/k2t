@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -163,7 +164,9 @@ func Run(opts Options) error {
 	//   cache for /dev/nvme0n1 was populated with Talos data by the disk
 	//   write above, so subsequent reads through the loop device see Talos
 	//   data without any cache drop.
-	exec.Command("sync").Run() //nolint:errcheck
+	// Use the sync(2) syscall directly to avoid fork+exec (os/exec.Cmd.Start
+	// can trigger a Go GC invariant violation in Go 1.21 when GC is mid-phase).
+	syscall.Syscall(syscall.SYS_SYNC, 0, 0, 0) //nolint:errcheck
 	log("Disk sync complete.")
 
 	// Relocate the backup GPT header to the end of the disk.  The Talos

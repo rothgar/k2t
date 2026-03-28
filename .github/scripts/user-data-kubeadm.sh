@@ -71,6 +71,11 @@ kubeadm init \
 mkdir -p /root/.kube
 cp /etc/kubernetes/admin.conf /root/.kube/config
 
+# Always use the admin kubeconfig explicitly so the env is independent of
+# $HOME (cloud-init may run with HOME != /root, causing kubectl to fall back
+# to the unauthenticated http://localhost:8080 endpoint).
+export KUBECONFIG=/etc/kubernetes/admin.conf
+
 # Allow scheduling on the control-plane node (single-node cluster).
 kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
 
@@ -80,6 +85,6 @@ kubectl apply -f \
 
 # Wait for the node to become Ready (up to 10 minutes).
 timeout 600 bash -c \
-  'until kubectl get nodes 2>/dev/null | grep -q " Ready"; do sleep 5; done'
+  'until kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes 2>/dev/null | grep -q " Ready"; do sleep 5; done'
 
 echo "kubeadm installation complete: $(kubelet --version)"
