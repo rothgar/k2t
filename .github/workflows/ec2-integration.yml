@@ -224,10 +224,18 @@ jobs:
       - name: Remove control-plane taint
         run: |
           export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
-          echo "Waiting for Kubernetes API to accept requests..."
-          for i in $(seq 1 60); do
-            kubectl get nodes 2>/dev/null && break
-            [ "$i" -eq 60 ] && { echo "Kubernetes API not ready after 5 min"; exit 1; }
+          # Wait for node to show Ready (not just API available) — this is the
+          # signal that kubelet and CNI (Flannel) are initialised and pods can
+          # be scheduled and networked.  Can take 10+ min after etcd restore.
+          echo "Waiting for Talos node to be Ready (up to 15 minutes)..."
+          for i in $(seq 1 180); do
+            if kubectl get nodes --no-headers 2>/dev/null | grep -q " Ready"; then
+              echo "Node Ready after $((i*5))s"
+              kubectl get nodes
+              break
+            fi
+            [ "$i" -eq 180 ] && { echo "Node not Ready after 15 min"; \
+              kubectl get nodes || true; exit 1; }
             sleep 5
           done
           kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
@@ -238,7 +246,7 @@ jobs:
         run: |
           export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
           echo "Waiting for ci-test-nginx pods to be Running after etcd restore..."
-          for i in $(seq 1 72); do
+          for i in $(seq 1 180); do
             RUNNING=$(kubectl get pods -l app=ci-test-nginx \
               --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
             if [ "$RUNNING" -ge 1 ]; then
@@ -246,8 +254,8 @@ jobs:
               kubectl get pods -l app=ci-test-nginx
               break
             fi
-            [ "$i" -eq 72 ] && { echo "✗ ci-test-nginx pods not Running after 6 min"; \
-              kubectl get pods; exit 1; }
+            [ "$i" -eq 180 ] && { echo "✗ ci-test-nginx pods not Running after 15 min"; \
+              kubectl get pods; kubectl describe pods -l app=ci-test-nginx; exit 1; }
             sleep 5
           done
 
@@ -584,14 +592,17 @@ jobs:
       - name: Remove control-plane taint
         run: |
           export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
-          for i in $(seq 1 60); do
-            kubectl get nodes 2>/dev/null && break
-            [ "$i" -eq 60 ] && { echo "kube API not ready"; exit 1; }
+          echo "Waiting for CP node to be Ready (up to 15 minutes)..."
+          for i in $(seq 1 180); do
+            if kubectl get nodes --no-headers 2>/dev/null | grep -q " Ready"; then
+              echo "Node Ready after $((i*5))s"; kubectl get nodes; break
+            fi
+            [ "$i" -eq 180 ] && { echo "Node not Ready after 15 min"; \
+              kubectl get nodes || true; exit 1; }
             sleep 5
           done
           kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
           echo "✓ Control-plane taint removed"
-          kubectl get nodes
 
       # ── Migrate worker node ───────────────────────────────────────────────
       - name: Run join-worker (worker node)
@@ -612,15 +623,15 @@ jobs:
       - name: Verify both nodes are Talos
         run: |
           export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
-          echo "Waiting for 2 Talos nodes to be Ready..."
-          for i in $(seq 1 60); do
+          echo "Waiting for 2 Talos nodes to be Ready (up to 15 minutes)..."
+          for i in $(seq 1 180); do
             READY=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready" || true)
             if [ "$READY" -ge 2 ]; then
-              echo "✓ Both nodes Ready"
+              echo "✓ Both nodes Ready after $((i*5))s"
               kubectl get nodes
               break
             fi
-            [ "$i" -eq 60 ] && { echo "✗ Only $READY/2 nodes Ready after 5 min"; \
+            [ "$i" -eq 180 ] && { echo "✗ Only $READY/2 nodes Ready after 15 min"; \
               kubectl get nodes || true; exit 1; }
             sleep 5
           done
@@ -628,8 +639,8 @@ jobs:
       - name: Verify ci-test-nginx is Running on Talos cluster
         run: |
           export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
-          echo "Waiting for ci-test-nginx pods to be Running..."
-          for i in $(seq 1 72); do
+          echo "Waiting for ci-test-nginx pods to be Running (up to 15 minutes)..."
+          for i in $(seq 1 180); do
             RUNNING=$(kubectl get pods -l app=ci-test-nginx \
               --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
             if [ "$RUNNING" -ge 1 ]; then
@@ -637,8 +648,8 @@ jobs:
               kubectl get pods -l app=ci-test-nginx
               break
             fi
-            [ "$i" -eq 72 ] && { echo "✗ ci-test-nginx not Running after 6 min"; \
-              kubectl get pods; exit 1; }
+            [ "$i" -eq 180 ] && { echo "✗ ci-test-nginx not Running after 15 min"; \
+              kubectl get pods; kubectl describe pods -l app=ci-test-nginx; exit 1; }
             sleep 5
           done
 
