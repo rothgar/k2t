@@ -407,6 +407,23 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 			return nil
 		}
 
+		// Fallback: talosconfig+insecure.  Workers in Talos v1.12+ may have
+		// an empty machine.ca.key in their config, so machined generates a
+		// self-signed cert that the CA chain in talosconfig cannot verify.
+		// Using --insecure skips server-cert verification while still
+		// presenting the client cert (satisfies machined's mTLS requirement).
+		if talosConfigFile != "" {
+			if _, insecureErr := b.runTalosctlWithOutput(talosctlPath, talosConfigFile,
+				"version", "--insecure",
+				"--nodes", host,
+				"--endpoints", host,
+			); insecureErr == nil {
+				s.Stop()
+				color.Green("  ✓ Talos gRPC API is ready (talosconfig+insecure, elapsed %s)\n", elapsed)
+				return nil
+			}
+		}
+
 		// ── Port probes ───────────────────────────────────────────────────────
 		port50kUp := tcpProbe(host+":50000", 3*time.Second)
 		port22Up := tcpProbe(host+":22", 3*time.Second)

@@ -3,9 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 
 	"github.com/fatih/color"
 	"github.com/rothgar/k3s-to-talos/internal/nextboot"
@@ -140,8 +138,6 @@ func runJoinWorker(cmd *cobra.Command, args []string) error {
 // Both approaches are verified: the output file is re-parsed to confirm host
 // appears in machine.certSANs before returning.
 func patchWorkerConfigCertSANs(cfgPath, host string) (string, func(), error) {
-	patchYAML := fmt.Sprintf("machine:\n  certSANs:\n    - %q\n", host)
-
 	tmp, err := os.CreateTemp("", "worker-patched-*.yaml")
 	if err != nil {
 		return "", func() {}, fmt.Errorf("creating temp config: %w", err)
@@ -149,29 +145,6 @@ func patchWorkerConfigCertSANs(cfgPath, host string) (string, func(), error) {
 	tmp.Close()
 	cleanup := func() { os.Remove(tmp.Name()) }
 
-	var patchErr error
-
-	// Approach 1: talosctl machineconfig patch (uses official Talos config parser)
-	if talosctlPath, lookErr := exec.LookPath("talosctl"); lookErr == nil {
-		out, cmdErr := exec.Command(talosctlPath, "machineconfig", "patch", cfgPath,
-			"--patch", patchYAML,
-			"--output", tmp.Name(),
-		).CombinedOutput()
-		if cmdErr == nil {
-			if verifyErr := verifyCertSANs(tmp.Name(), host); verifyErr == nil {
-				fmt.Printf("  ✓ worker.yaml patched via talosctl (certSANs=[%s])\n", host)
-				return tmp.Name(), cleanup, nil
-			} else {
-				patchErr = fmt.Errorf("talosctl patch produced output missing certSANs: %w", verifyErr)
-				color.Yellow("  Warning: %v\n", patchErr)
-			}
-		} else {
-			patchErr = fmt.Errorf("talosctl machineconfig patch: %w\n%s", cmdErr, strings.TrimSpace(string(out)))
-			color.Yellow("  Warning: %v\n", patchErr)
-		}
-	}
-
-	// Approach 2: sigs.k8s.io/yaml round-trip
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		cleanup()
@@ -195,8 +168,7 @@ func patchWorkerConfigCertSANs(cfgPath, host string) (string, func(), error) {
 	if existing, ok := machine["certSANs"].([]interface{}); ok {
 		for _, e := range existing {
 			if s, _ := e.(string); s == host {
-				// Already present — verify and use original file.
-				_ = patchErr // suppress unused warning
+				// Already present — use original file unchanged.
 				fmt.Printf("  ✓ certSANs=[%s] already present in worker.yaml\n", host)
 				cleanup()
 				return cfgPath, func() {}, nil
