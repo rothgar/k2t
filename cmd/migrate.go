@@ -185,6 +185,16 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		}
 
 		talosConfigDir := filepath.Join(flagBackupDir, "talos-config")
+		// For kubeadm, the Flannel DaemonSet from etcd restore runs in the
+		// kube-flannel namespace.  If Talos also installs Flannel (default CNI),
+		// two competing daemons both try to configure the flannel.1 VXLAN
+		// interface, breaking pod networking.  Set CNI to "none" so Talos
+		// defers entirely to the kubeadm Flannel restored from etcd.
+		var cniName string
+		if state.ClusterInfo.ClusterType == k3s.ClusterTypeKubeadm {
+			cniName = "none"
+		}
+
 		gen := talos.NewConfigGenerator(flagBackupDir)
 		if err := gen.Generate(talos.GenerateOptions{
 			ClusterName:                   clusterName,
@@ -195,6 +205,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 			PodCIDR:                       state.ClusterInfo.PodCIDR,
 			ServiceCIDR:                   state.ClusterInfo.ServiceCIDR,
 			AllowSchedulingOnControlPlane: state.ClusterInfo.AllowSchedulingOnControlPlane,
+			CNIName:                       cniName,
 		}); err != nil {
 			return fmt.Errorf("generating Talos config: %w", err)
 		}

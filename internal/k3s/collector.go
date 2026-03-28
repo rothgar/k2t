@@ -411,8 +411,22 @@ func (c *Collector) detectNetworkCIDRs(info *ClusterInfo) {
 	}
 
 	// ── Service CIDR ──────────────────────────────────────────────────────────
-	// The service CIDR is not directly queryable from the Kubernetes API.
-	// Default to k3s's default; a future enhancement could parse k3s process
-	// flags or the kube-apiserver --service-cluster-ip-range argument.
+	// For kubeadm, read --service-cluster-ip-range from the kube-apiserver
+	// static-pod manifest.  The kubeadm default (10.96.0.0/12) differs from
+	// the k3s default (10.43.0.0/16); using the wrong value causes existing
+	// ClusterIP services (kubernetes.default, kube-dns) to be unreachable.
+	if c.clusterType == ClusterTypeKubeadm {
+		const defaultKubeadmServiceCIDR = "10.96.0.0/12"
+		out, _ := c.ssh.Run(
+			`grep -o -- '--service-cluster-ip-range=[^ "]*' ` +
+				`/etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null | cut -d= -f2`)
+		cidr := strings.TrimSpace(strings.Trim(out, "'"))
+		if cidr != "" {
+			info.ServiceCIDR = cidr
+		} else {
+			info.ServiceCIDR = defaultKubeadmServiceCIDR
+		}
+		return
+	}
 	info.ServiceCIDR = defaultServiceCIDR
 }

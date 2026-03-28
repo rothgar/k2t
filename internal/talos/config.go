@@ -31,6 +31,13 @@ type GenerateOptions struct {
 	// node-role.kubernetes.io/control-plane:NoSchedule taint, matching the
 	// source cluster's behaviour (e.g. k3s single-node, kubeadm with taint removed).
 	AllowSchedulingOnControlPlane bool
+	// CNIName overrides the Talos CNI. Set to "none" when the source cluster's
+	// CNI DaemonSet is preserved via etcd restore (e.g. kubeadm's Flannel in
+	// kube-flannel namespace): having Talos also install Flannel in kube-system
+	// creates two competing daemons that both try to configure the flannel.1
+	// VXLAN interface, breaking pod networking after the restore.
+	// Leave empty to use the Talos default ("flannel").
+	CNIName string // e.g. "none"
 }
 
 // ConfigGenerator runs talosctl gen config to produce machine configs.
@@ -84,13 +91,19 @@ func (g *ConfigGenerator) Generate(opts GenerateOptions) error {
 	// JSON6902 patches are not supported for multi-document configs in
 	// talosctl v1.12; we use YAML strategic-merge patches throughout.
 	cpPatch := fmt.Sprintf("machine:\n  certSANs:\n    - %q\n", opts.ControlPlaneIP)
-	if opts.PodCIDR != "" || opts.ServiceCIDR != "" || opts.AllowSchedulingOnControlPlane {
+	needsCluster := opts.AllowSchedulingOnControlPlane || opts.CNIName != "" ||
+		opts.PodCIDR != "" || opts.ServiceCIDR != ""
+	if needsCluster {
 		cpPatch += "cluster:\n"
 		if opts.AllowSchedulingOnControlPlane {
 			cpPatch += "  allowSchedulingOnControlPlanes: true\n"
 		}
-		if opts.PodCIDR != "" || opts.ServiceCIDR != "" {
+		needsNetwork := opts.CNIName != "" || opts.PodCIDR != "" || opts.ServiceCIDR != ""
+		if needsNetwork {
 			cpPatch += "  network:\n"
+			if opts.CNIName != "" {
+				cpPatch += fmt.Sprintf("    cni:\n      name: %s\n", opts.CNIName)
+			}
 			if opts.PodCIDR != "" {
 				cpPatch += fmt.Sprintf("    podSubnets:\n      - %q\n", opts.PodCIDR)
 			}
