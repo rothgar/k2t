@@ -87,7 +87,7 @@ func (g *ConfigGenerator) Generate(opts GenerateOptions) error {
 	if opts.PodCIDR != "" || opts.ServiceCIDR != "" || opts.AllowSchedulingOnControlPlane {
 		cpPatch += "cluster:\n"
 		if opts.AllowSchedulingOnControlPlane {
-			cpPatch += "  allowSchedulingOnControlPlane: true\n"
+			cpPatch += "  allowSchedulingOnControlPlanes: true\n"
 		}
 		if opts.PodCIDR != "" || opts.ServiceCIDR != "" {
 			cpPatch += "  network:\n"
