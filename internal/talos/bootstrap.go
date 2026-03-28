@@ -140,12 +140,10 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 		color.Green("  ✓ Cluster bootstrapped\n")
 	}
 
-	// Step 4: Wait for Kubernetes API
-	if err := b.waitForKubernetesAPI(opts.Host, opts.TalosConfigFile); err != nil {
-		return err
-	}
-
-	// Step 5: Retrieve kubeconfig
+	// Step 4: Retrieve kubeconfig.
+	// talosctl kubeconfig talks to the Talos gRPC API (port 50000), not the
+	// Kubernetes API, so it can be fetched as soon as the Talos API is ready —
+	// before the kube-apiserver has finished starting up.
 	fmt.Printf("  Retrieving kubeconfig → %s\n", opts.KubeconfigOut)
 	if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
 		"kubeconfig",
@@ -158,6 +156,11 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 		return fmt.Errorf("retrieving kubeconfig: %w", err)
 	}
 	color.Green("  ✓ Kubeconfig saved to %s\n", opts.KubeconfigOut)
+
+	// Step 5: Wait for Kubernetes API
+	if err := b.waitForKubernetesAPI(opts.Host, opts.TalosConfigFile); err != nil {
+		return err
+	}
 
 	return nil
 }
