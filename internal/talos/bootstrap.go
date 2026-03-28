@@ -213,7 +213,7 @@ func (b *Bootstrapper) BootstrapWorker(opts WorkerBootstrapOptions) error {
 				"--nodes", opts.Host,
 				"--endpoints", opts.Host,
 				"--file", opts.WorkerCfgFile,
-				"--patch", certSANsPatch,
+				"--config-patch", certSANsPatch,
 			); applyErr != nil {
 				color.Yellow("  Warning: apply-config returned an error: %v\n", summariseError(applyErr))
 				color.Yellow("  Will retry inside waitForTalosctlReady.\n")
@@ -238,7 +238,7 @@ func (b *Bootstrapper) BootstrapWorker(opts WorkerBootstrapOptions) error {
 				"--nodes", opts.Host,
 				"--endpoints", opts.Host,
 				"--file", opts.WorkerCfgFile,
-				"--patch", certSANsPatch,
+				"--config-patch", certSANsPatch,
 			); applyErr != nil {
 				color.Yellow("  apply-config (talosconfig+insecure) returned an error: %v\n", summariseError(applyErr))
 				color.Yellow("  Will retry inside waitForTalosctlReady.\n")
@@ -585,7 +585,7 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 				"--file", controlPlaneCfg,
 			}
 			if configPatch != "" {
-				applyArgs = append(applyArgs, "--patch", configPatch)
+				applyArgs = append(applyArgs, "--config-patch", configPatch)
 			}
 			applyOut, applyErr := b.runTalosctlInsecureWithOutput(talosctlPath, applyArgs...)
 			if applyErr != nil {
