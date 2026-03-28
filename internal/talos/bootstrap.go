@@ -2,6 +2,7 @@ package talos
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -405,12 +406,18 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 		attempt++
 		elapsed := time.Since(start).Round(time.Second)
 
-		// ── CA-verified talosctl version ─────────────────────────────────────
-		err := b.runTalosctl(talosctlPath, talosConfigFile,
+		// ── CA-verified talosctl version (30-second timeout) ─────────────────
+		// Use exec.CommandContext so the subprocess is killed if it hangs (e.g.
+		// gRPC dial never completes when machined is slow to respond). Without a
+		// timeout, one hung talosctl call blocks the entire loop iteration and the
+		// 35-minute deadline check is never reached.
+		versionCtx, versionCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := b.runTalosctlCtx(versionCtx, talosctlPath, talosConfigFile,
 			"version",
 			"--nodes", host,
 			"--endpoints", host,
 		)
+		versionCancel()
 		if err == nil {
 			s.Stop()
 			color.Green("  ✓ Talos gRPC API is ready (elapsed %s)\n", elapsed)
@@ -421,35 +428,42 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 		port50kUp := tcpProbe(host+":50000", 3*time.Second)
 		port22Up := tcpProbe(host+":22", 3*time.Second)
 
-		// ── Cert-error soak ───────────────────────────────────────────────────
-		// If the CA-verified check fails with a TLS cert error (not a connection-
-		// refused / timeout error) while port 50000 is UP, the node IS running
-		// Talos — it's just using a self-signed cert.  This happens on Talos
-		// v1.12+ workers where machine.ca.key is absent and machined cannot
-		// issue a CA-signed cert.
+		// ── Port-50000-UP soak ────────────────────────────────────────────────
+		// On Talos v1.12+ workers, machine.ca.key is absent so machined cannot
+		// issue a CA-signed cert — it generates a self-signed one.  talosctl CA-
+		// verified checks therefore always fail for workers.  Additionally the
+		// error type is not always a TLS/x509 error: if talosctl's internal gRPC
+		// timeout fires before the TLS handshake the error is "context deadline
+		// exceeded", which contains no cert keywords.
 		//
-		// In talosctl v1.12+ "--insecure" means "maintenance mode API" (no mTLS),
-		// not "skip TLS cert verification".  There is no talosctl flag to connect
-		// to a configured-mode node while skipping CA verification.
+		// Strategy: if port 50000 stays UP continuously for certErrorSoakTime
+		// while talosctl keeps failing (any error), accept the node as ready.
+		// certErrorSince is reset ONLY when port 50000 goes DOWN so that brief
+		// reboots restart the timer but spurious non-cert errors do not.
 		//
-		// Strategy: if the cert error persists for certErrorSoakTime while port
-		// 50000 stays UP, accept the node as ready.  The worker.yaml config was
-		// written to the STATE partition before the reboot, so the worker booted
-		// in configured mode and will join the cluster via the embedded token.
-		if port50kUp && isCertError(err) {
+		// For the control-plane case, apply-config --insecure succeeds (CP is in
+		// maintenance mode) and the CP reboots (port goes DOWN), which resets
+		// certErrorSince before certErrorSoakTime elapses.  For workers in
+		// configured mode, apply-config --insecure fails and the port stays UP.
+		if port50kUp {
 			if certErrorSince.IsZero() {
 				certErrorSince = time.Now()
 			}
-			if time.Since(certErrorSince) >= certErrorSoakTime {
+			soakElapsed := time.Since(certErrorSince)
+			if soakElapsed >= certErrorSoakTime {
 				s.Stop()
-				color.Yellow("  ⚠ CA cert verification has failed for %s, but port 50000 "+
-					"has been UP — node is running Talos with a self-signed cert (elapsed %s)\n",
-					time.Since(certErrorSince).Round(time.Second), elapsed)
+				errKind := "connection error"
+				if isCertError(err) {
+					errKind = "cert error"
+				}
+				color.Yellow("  ⚠ talosctl CA-verified check has failed (%s) for %s with "+
+					"port 50000 continuously UP — node is running Talos (elapsed %s)\n",
+					errKind, soakElapsed.Round(time.Second), elapsed)
 				color.Yellow("  Treating as ready (worker joins cluster via embedded token)\n")
 				return nil
 			}
-		} else if !isCertError(err) {
-			certErrorSince = time.Time{} // reset if error type changed
+		} else {
+			certErrorSince = time.Time{} // reset only when port 50000 goes DOWN
 		}
 
 		// ── Track port-50000 transitions (detect reboots) ─────────────────────
@@ -693,6 +707,24 @@ func summariseError(err error) string {
 func (b *Bootstrapper) runTalosctl(binary, talosconfig string, args ...string) error {
 	_, err := b.runTalosctlWithOutput(binary, talosconfig, args...)
 	return err
+}
+
+// runTalosctlCtx runs talosctl with a context (for timeout/cancellation).
+// Used for the readiness-check loop so a hanging subprocess is killed rather
+// than blocking the entire loop iteration indefinitely.
+func (b *Bootstrapper) runTalosctlCtx(ctx context.Context, binary, talosconfig string, args ...string) error {
+	allArgs := append([]string{"--talosconfig", talosconfig}, args...)
+	cmd := exec.CommandContext(ctx, binary, allArgs...)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		combined := strings.TrimSpace(stdout.String() + "\n" + stderr.String())
+		return fmt.Errorf("%w\n%s", err, combined)
+	}
+	return nil
 }
 
 // runTalosctlWithOutput runs talosctl and returns (stdout+stderr, error).
