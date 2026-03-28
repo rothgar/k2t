@@ -49,15 +49,13 @@ func (g *ConfigGenerator) Generate(opts GenerateOptions) error {
 
 	endpoint := fmt.Sprintf("https://%s:6443", opts.ControlPlaneIP)
 
-	// Patch to add the public IP to machine.certSANs so that talosctl can
-	// verify the server TLS cert when connecting via the public IP.
-	// On EC2 (and other cloud providers) the public IP is not assigned to a
-	// network interface, so Talos would not auto-detect it and include it in
-	// the server cert's SANs, causing all CA-verified talosctl calls to fail.
-	certSANsPatch := fmt.Sprintf(
-		`[{"op":"add","path":"/machine/certSANs","value":[%q]}]`,
-		opts.ControlPlaneIP,
-	)
+	// Strategic-merge patch to add the public IP to machine.certSANs.
+	// On EC2 (and other cloud providers) the public IP is not on any network
+	// interface, so Talos would not auto-include it in the machined TLS server
+	// cert SANs — causing all CA-verified talosctl calls to fail with an x509
+	// SAN mismatch.  JSON6902 patches are not supported for multi-document
+	// configs in talosctl v1.12, so we use a YAML strategic-merge patch.
+	certSANsPatch := fmt.Sprintf("machine:\n  certSANs:\n    - %q\n", opts.ControlPlaneIP)
 
 	args := []string{
 		"gen", "config",
