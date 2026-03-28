@@ -104,18 +104,11 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 			if !flagMigrateToEtcd {
 				return fmt.Errorf(
 					"k3s is using SQLite as its datastore, but Talos requires etcd.\n\n" +
-						"The etcd snapshot restore path that this tool uses to preserve your\n" +
-						"workloads only works when k3s is running with embedded etcd.\n\n" +
-						"Options:\n" +
-						"  1. Re-run with --migrate-to-etcd to automatically convert the\n" +
-						"     datastore to embedded etcd before taking the backup.\n" +
-						"     This restarts k3s — expect a brief API downtime.\n\n" +
-						"  2. Convert manually: add '--cluster-init' to the k3s ExecStart,\n" +
-						"     restart k3s, wait for etcd/member to appear, then remove the flag\n" +
-						"     and restart again.  Then re-run this command.\n\n" +
-						"  3. Proceed without a workload restore: the YAML resource backup will\n" +
-						"     still be taken and can be applied manually after migration, but\n" +
-						"     in-cluster state (e.g. PV data) will not be preserved.")
+						"The etcd snapshot restore path used to preserve your workloads only\n" +
+						"works when k3s is running with embedded etcd.\n\n" +
+						"Re-run with --migrate-to-etcd to automatically convert the datastore\n" +
+						"to embedded etcd before taking the backup.  k3s will be restarted —\n" +
+						"expect a brief API downtime (~30 s).")
 			}
 
 			if flagDryRun {
