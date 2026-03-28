@@ -1291,9 +1291,10 @@ jobs:
             --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
 
           # Generate a fresh join command (includes a short-lived bootstrap token).
-          # Override the API server address to use the private IP.
-          JOIN_CMD=$($SSH_CP "sudo kubeadm token create --print-join-command \
-            --apiserver-advertise-address=${CP_PRIVATE_IP} 2>/dev/null | tail -1")
+          # kubeadm init used the private IP as the advertise address, so the
+          # join command will naturally reference the private IP — no override needed.
+          # (--apiserver-advertise-address is a kubeadm init flag, not token create.)
+          JOIN_CMD=$($SSH_CP "sudo kubeadm token create --print-join-command 2>/dev/null | tail -1")
           echo "::add-mask::$(echo $JOIN_CMD | grep -o '[0-9a-h]\{6\}\.[0-9a-z]\{16\}' || true)"
           echo "Join command obtained (token masked)"
 
