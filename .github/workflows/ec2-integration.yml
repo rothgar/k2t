@@ -632,6 +632,32 @@ jobs:
           $SSH "sudo systemctl stop k3s 2>/dev/null || true"
           echo "✓ k3s-agent stopped (or was not running)"
 
+      # Kill unattended-upgrades to release the apt lock before nextboot.
+      # The worker machine has been running for ~45 min by this point, long
+      # enough for apt-daily-upgrade.service to start and hold the dpkg lock.
+      # The nextboot agent calls apt-get to install efibootmgr/sgdisk; if apt
+      # is locked, apt-get hangs indefinitely, the SSH TCP connection idles,
+      # an intermediate NAT clears the state, and installer.Run() falsely
+      # treats the disconnect as a successful machine reboot.
+      - name: Kill unattended-upgrades on worker
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$WORKER_IP"
+          echo "Stopping unattended-upgrades and apt services..."
+          $SSH "sudo systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true"
+          $SSH "sudo systemctl mask apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true"
+          $SSH "sudo killall -9 unattended-upgrade unattended-upgrades apt-get dpkg 2>/dev/null || true"
+          echo "Waiting for apt/dpkg lock to be released..."
+          for i in $(seq 1 30); do
+            if ! $SSH "sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null" 2>/dev/null; then
+              echo "apt lock is free after ${i}s"
+              break
+            fi
+            sleep 2
+          done
+          echo "=== apt lock status ==="
+          $SSH "sudo fuser /var/lib/dpkg/lock-frontend 2>/dev/null && echo 'LOCK STILL HELD' || echo 'Lock free'" || echo "Lock free"
+          echo "✓ unattended-upgrades killed"
+
       # ── Migrate worker node ───────────────────────────────────────────────
       - name: Run join-worker (worker node)
         run: |
@@ -670,6 +696,12 @@ jobs:
           else
             echo "Worker SSH (port 22) is closed — worker has rebooted out of Ubuntu (expected for success)"
           fi
+          echo ""
+          echo "=== Worker EC2 serial console (boot log after reboot) ==="
+          aws ec2 get-console-output \
+            --instance-id "${{ steps.ec2-worker.outputs.instance-id }}" \
+            --latest --output text 2>/dev/null \
+            | tail -80 || echo "(no console output available)"
 
       # ── Verify both nodes are Talos and workload is running ───────────────
       - name: Verify both nodes are Talos

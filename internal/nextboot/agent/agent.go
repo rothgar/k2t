@@ -326,7 +326,11 @@ func ensureTool(name string) error {
 		pkg = p
 	}
 	log("%s not found — installing package %s via apt-get...", name, pkg)
-	if out, err := exec.Command("apt-get", "install", "-y", "-q", pkg).CombinedOutput(); err != nil {
+	// Use a 120-second lock timeout so we fail fast with a clear error rather
+	// than hanging indefinitely if unattended-upgrades holds the apt lock.
+	if out, err := exec.Command("apt-get", "install", "-y", "-q",
+		"-o", "DPkg::Lock::Timeout=120",
+		pkg).CombinedOutput(); err != nil {
 		return fmt.Errorf("installing %s (package %s): %w\n%s", name, pkg, err, string(out))
 	}
 	return nil
