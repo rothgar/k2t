@@ -604,6 +604,72 @@ jobs:
           kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
           echo "✓ Control-plane taint removed"
 
+      # After migrating from k3s (etcd restore), the Talos bootstrap token
+      # (cluster.token from gen config) does not exist in the Kubernetes API —
+      # the restored k3s etcd data contains k3s's own state, not the Talos
+      # bootstrap token Secret.  Talos worker nodes use this token to bootstrap
+      # their kubelet kubeconfig (standard Kubernetes bootstrap-token flow).
+      # Without it the kubelet cannot submit a CSR, and the worker never joins.
+      #
+      # We create the token Secret here (after the CP is Ready and before the
+      # worker migration) so the worker's kubelet can authenticate on first boot.
+      - name: Create Kubernetes bootstrap token for worker join
+        run: |
+          export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
+
+          # Extract cluster token from worker.yaml.
+          TOKEN=$(python3 -c "
+import yaml, sys
+with open('test-backup/talos-config/worker.yaml') as f:
+    cfg = yaml.safe_load(f)
+tok = cfg.get('cluster', {}).get('token', '')
+if not tok:
+    sys.exit(1)
+print(tok)
+" 2>/dev/null) || { echo "Warning: could not parse cluster token — worker join may fail"; exit 0; }
+
+          TOKEN_ID="${TOKEN%%.*}"
+          TOKEN_SECRET="${TOKEN##*.}"
+          echo "Cluster token ID: ${TOKEN_ID} (secret length: ${#TOKEN_SECRET})"
+
+          # Create bootstrap token Secret (stringData → kube base64-encodes it).
+          kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bootstrap-token-${TOKEN_ID}
+  namespace: kube-system
+type: bootstrap.kubernetes.io/token
+stringData:
+  token-id: "${TOKEN_ID}"
+  token-secret: "${TOKEN_SECRET}"
+  usage-bootstrap-authentication: "true"
+  usage-bootstrap-signing: "true"
+  auth-extra-groups: "system:bootstrappers:kubernetes"
+EOF
+
+          # Ensure the bootstrappers group can submit CSRs.
+          # system:node-bootstrapper is a built-in ClusterRole; the binding may
+          # not exist after etcd restore from k3s (k3s uses its own join mechanism).
+          kubectl create clusterrolebinding talos-bootstrapper-node-token \
+              --clusterrole=system:node-bootstrapper \
+              --group=system:bootstrappers:kubernetes \
+              2>/dev/null || echo "(ClusterRoleBinding already exists)"
+
+          # Allow auto-approval of kubelet client CSRs for bootstrap nodes.
+          kubectl create clusterrolebinding talos-bootstrapper-csr-nodeclient \
+              --clusterrole=system:certificates.k8s.io:certificatesigningrequests:nodeclient \
+              --group=system:bootstrappers:kubernetes \
+              2>/dev/null || echo "(CSR approval binding already exists)"
+
+          # Allow nodes to renew their own server certs.
+          kubectl create clusterrolebinding talos-bootstrapper-csr-selfnodeclient \
+              --clusterrole=system:certificates.k8s.io:certificatesigningrequests:selfnodeclient \
+              --group=system:nodes \
+              2>/dev/null || echo "(self-renewal binding already exists)"
+
+          echo "✓ Bootstrap token and RBAC applied (token-id: ${TOKEN_ID})"
+
       # ── Pre-flight diagnostics: worker state before nextboot ─────────────
       - name: Worker pre-flight diagnostics
         run: |
@@ -723,8 +789,22 @@ jobs:
               kubectl get nodes
               break
             fi
-            [ "$i" -eq 180 ] && { echo "✗ Only $READY/2 nodes Ready after 15 min"; \
-              kubectl get nodes || true; exit 1; }
+            # Periodic status every 60s so we can see join progress in logs.
+            [ $((i % 12)) -eq 0 ] && {
+              echo "--- node status at $((i*5))s ---"
+              kubectl get nodes --no-headers 2>/dev/null || true
+              echo "--- pending CSRs ---"
+              kubectl get csr --no-headers 2>/dev/null | head -10 || true
+            }
+            [ "$i" -eq 180 ] && {
+              echo "✗ Only $READY/2 nodes Ready after 15 min"
+              kubectl get nodes -o wide || true
+              echo "=== CSRs ==="
+              kubectl get csr 2>/dev/null || true
+              echo "=== kube-system bootstrap token ==="
+              kubectl get secret -n kube-system -l "type=bootstrap.kubernetes.io/token" 2>/dev/null || true
+              exit 1
+            }
             sleep 5
           done
 
