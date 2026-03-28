@@ -18,6 +18,13 @@ type GenerateOptions struct {
 	TalosVersion   string
 	OutputDir      string
 	DryRun         bool
+	// PodCIDR and ServiceCIDR override the default Talos network ranges so
+	// they match the source cluster.  After etcd restore the old Flannel
+	// network config (stored in etcd by the source cluster) must match what
+	// Talos configures — otherwise Flannel crashes and pods cannot start.
+	// Leave empty to use Talos defaults (10.244.0.0/16 / 10.96.0.0/12).
+	PodCIDR     string // e.g. "10.42.0.0/16" (k3s default)
+	ServiceCIDR string // e.g. "10.43.0.0/16" (k3s default)
 }
 
 // ConfigGenerator runs talosctl gen config to produce machine configs.
@@ -49,13 +56,32 @@ func (g *ConfigGenerator) Generate(opts GenerateOptions) error {
 
 	endpoint := fmt.Sprintf("https://%s:6443", opts.ControlPlaneIP)
 
-	// Strategic-merge patch to add the public IP to machine.certSANs.
-	// On EC2 (and other cloud providers) the public IP is not on any network
-	// interface, so Talos would not auto-include it in the machined TLS server
-	// cert SANs — causing all CA-verified talosctl calls to fail with an x509
-	// SAN mismatch.  JSON6902 patches are not supported for multi-document
-	// configs in talosctl v1.12, so we use a YAML strategic-merge patch.
-	certSANsPatch := fmt.Sprintf("machine:\n  certSANs:\n    - %q\n", opts.ControlPlaneIP)
+	// Strategic-merge patch applied to all generated machine configs.
+	//
+	// machine.certSANs — add the public IP so that CA-verified talosctl calls
+	// via the public IP succeed after config is applied.  On EC2 (and other
+	// cloud providers) the public IP is not on any interface, so Talos would
+	// not auto-include it in the machined TLS cert SANs.
+	//
+	// cluster.network — use the source cluster's pod/service CIDRs.  After
+	// etcd restore, Flannel finds its existing network config (stored by the
+	// source cluster in etcd) and refuses to switch to a different CIDR.
+	// Setting the same CIDRs avoids CNI failures that leave pods in
+	// ContainerCreating indefinitely.  JSON6902 patches are not supported for
+	// multi-document configs in talosctl v1.12, so we use a YAML
+	// strategic-merge patch.
+	podCIDR := opts.PodCIDR
+	serviceCIDR := opts.ServiceCIDR
+	configPatch := fmt.Sprintf("machine:\n  certSANs:\n    - %q\n", opts.ControlPlaneIP)
+	if podCIDR != "" || serviceCIDR != "" {
+		configPatch += "cluster:\n  network:\n"
+		if podCIDR != "" {
+			configPatch += fmt.Sprintf("    podSubnets:\n      - %q\n", podCIDR)
+		}
+		if serviceCIDR != "" {
+			configPatch += fmt.Sprintf("    serviceSubnets:\n      - %q\n", serviceCIDR)
+		}
+	}
 
 	args := []string{
 		"gen", "config",
@@ -63,7 +89,7 @@ func (g *ConfigGenerator) Generate(opts GenerateOptions) error {
 		endpoint,
 		"--output", opts.OutputDir,
 		"--output-types", "controlplane,worker,talosconfig",
-		"--config-patch", certSANsPatch,
+		"--config-patch", configPatch,
 		"--force",
 	}
 

@@ -3,6 +3,7 @@ package k3s
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -24,6 +25,8 @@ type ClusterInfo struct {
 	PVCount       int                 `json:"pv_count"`
 	PVs           []PV                `json:"pvs,omitempty"`
 	Hardware      *talos.HardwareInfo `json:"hardware,omitempty"`
+	PodCIDR       string              `json:"pod_cidr,omitempty"`     // cluster pod CIDR
+	ServiceCIDR   string              `json:"service_cidr,omitempty"` // cluster service CIDR
 }
 
 // Node represents a Kubernetes node in the k3s cluster.
@@ -121,6 +124,9 @@ func (c *Collector) Collect() (*ClusterInfo, error) {
 	if err := c.collectPVs(info); err != nil {
 		fmt.Printf("\nWarning: could not collect PV info: %v\n", err)
 	}
+
+	s.Suffix = " Detecting cluster network CIDRs..."
+	c.detectNetworkCIDRs(info)
 
 	return info, nil
 }
@@ -330,4 +336,50 @@ func (c *Collector) collectPVs(info *ClusterInfo) error {
 	}
 	info.PVCount = len(info.PVs)
 	return nil
+}
+
+// detectNetworkCIDRs attempts to discover the cluster-wide pod and service CIDRs.
+//
+// Pod CIDR:     read from the first node's spec.podCIDR and expand it to the
+//               cluster-level prefix.  k3s allocates /24 per node from a /16,
+//               so we expand the /24 to its containing /16.
+// Service CIDR: not exposed via the Kubernetes API; we default to the k3s
+//               default (10.43.0.0/16) which is correct for the vast majority
+//               of k3s installations.
+//
+// Falls back to k3s defaults (10.42.0.0/16 / 10.43.0.0/16) when detection fails.
+func (c *Collector) detectNetworkCIDRs(info *ClusterInfo) {
+	const defaultPodCIDR     = "10.42.0.0/16"
+	const defaultServiceCIDR = "10.43.0.0/16"
+
+	// ── Pod CIDR ──────────────────────────────────────────────────────────────
+	out, err := c.ssh.Run(c.kubectlBin() +
+		" get nodes -o jsonpath='{.items[0].spec.podCIDR}' 2>/dev/null")
+	nodeCIDR := strings.TrimSpace(strings.Trim(out, "'"))
+	if err == nil && nodeCIDR != "" {
+		_, ipnet, parseErr := net.ParseCIDR(nodeCIDR)
+		if parseErr == nil {
+			ones, bits := ipnet.Mask.Size()
+			_ = bits
+			// Expand the per-node subnet to the cluster-level CIDR.
+			// k3s allocates /24 per node from a /16; for other prefixes keep as-is.
+			if ones >= 16 {
+				// Mask to the /16 containing this subnet.
+				clusterMask := net.CIDRMask(16, 32)
+				clusterIP := ipnet.IP.Mask(clusterMask)
+				info.PodCIDR = fmt.Sprintf("%s/16", clusterIP.String())
+			} else {
+				info.PodCIDR = ipnet.String()
+			}
+		}
+	}
+	if info.PodCIDR == "" {
+		info.PodCIDR = defaultPodCIDR
+	}
+
+	// ── Service CIDR ──────────────────────────────────────────────────────────
+	// The service CIDR is not directly queryable from the Kubernetes API.
+	// Default to k3s's default; a future enhancement could parse k3s process
+	// flags or the kube-apiserver --service-cluster-ip-range argument.
+	info.ServiceCIDR = defaultServiceCIDR
 }

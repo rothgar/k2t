@@ -153,6 +153,8 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 			TalosVersion:   flagTalosVersion,
 			OutputDir:      talosConfigDir,
 			DryRun:         flagDryRun,
+			PodCIDR:        state.ClusterInfo.PodCIDR,
+			ServiceCIDR:    state.ClusterInfo.ServiceCIDR,
 		}); err != nil {
 			return fmt.Errorf("generating Talos config: %w", err)
 		}
