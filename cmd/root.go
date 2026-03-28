@@ -44,6 +44,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&flagSudo, "sudo", false, "Prefix remote commands with sudo (for non-root SSH users)")
 
 	rootCmd.AddCommand(migrateCmd)
+	rootCmd.AddCommand(joinWorkerCmd)
 	rootCmd.AddCommand(collectCmd)
 	rootCmd.AddCommand(generateCmd)
 }

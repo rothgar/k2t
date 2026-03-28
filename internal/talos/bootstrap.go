@@ -89,7 +89,7 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 
 	// Step 2b: Wait for Talos gRPC API to be ready (CA-verified).
 	fmt.Println("  Waiting for Talos gRPC API to be ready (up to 35 minutes)...")
-	if err := b.waitForTalosctlReady(talosctlPath, opts.TalosConfigFile, opts.Host, opts.ControlPlaneCfg); err != nil {
+	if err := b.waitForTalosctlReady(talosctlPath, opts.TalosConfigFile, opts.Host, opts.ControlPlaneCfg, ""); err != nil {
 		return fmt.Errorf("waiting for Talos after config apply: %w", err)
 	}
 
@@ -160,6 +160,74 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 	// Step 5: Wait for Kubernetes API
 	if err := b.waitForKubernetesAPI(opts.Host, opts.TalosConfigFile); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+// WorkerBootstrapOptions holds parameters for bootstrapping a Talos worker node.
+type WorkerBootstrapOptions struct {
+	Host            string
+	TalosConfigFile string // talosconfig from the CP migration
+	WorkerCfgFile   string // worker.yaml from the CP migration
+}
+
+// BootstrapWorker installs Talos on a worker node and waits for it to join the
+// cluster.  Unlike Bootstrap it does not touch etcd or retrieve a kubeconfig —
+// the worker joins automatically via the token embedded in worker.yaml.
+//
+// On EC2 the public IP is NAT'd and not on any interface, so machined would
+// not auto-include it in the server TLS cert SANs.  BootstrapWorker therefore
+// injects machine.certSANs=[host] via the apply-config --patch flag so that
+// CA-verified talosctl calls via the public IP succeed after the first reboot.
+func (b *Bootstrapper) BootstrapWorker(opts WorkerBootstrapOptions) error {
+	talosctlPath, err := exec.LookPath("talosctl")
+	if err != nil {
+		return fmt.Errorf("talosctl not found in PATH")
+	}
+
+	certSANsPatch := fmt.Sprintf("machine:\n  certSANs:\n    - %q\n", opts.Host)
+
+	// Step 1: Wait for Talos to respond on port 50000.
+	if err := b.waitForTalosAPI(opts.Host); err != nil {
+		return err
+	}
+
+	// Step 2: Check if already configured; otherwise probe maintenance mode.
+	fmt.Println("  Checking if worker Talos is already in configured mode...")
+	if err := b.runTalosctl(talosctlPath, opts.TalosConfigFile,
+		"version",
+		"--nodes", opts.Host,
+		"--endpoints", opts.Host,
+	); err == nil {
+		color.Green("  ✓ Worker Talos is already in configured mode\n")
+	} else {
+		fmt.Printf("  CA-verified check failed (%v)\n", summariseError(err))
+		fmt.Println("  Probing for worker maintenance mode...")
+		inMaintenance := b.probeMaintenanceMode(talosctlPath, opts.TalosConfigFile, opts.Host, 90*time.Second)
+		if inMaintenance {
+			fmt.Println("  Worker is in maintenance mode — applying worker configuration...")
+			if applyErr := b.runTalosctlInsecure(talosctlPath,
+				"apply-config",
+				"--nodes", opts.Host,
+				"--endpoints", opts.Host,
+				"--file", opts.WorkerCfgFile,
+				"--patch", certSANsPatch,
+			); applyErr != nil {
+				color.Yellow("  Warning: apply-config returned an error: %v\n", summariseError(applyErr))
+				color.Yellow("  Will retry inside waitForTalosctlReady.\n")
+			} else {
+				color.Green("  ✓ Worker config applied — waiting for reboot\n")
+			}
+		} else {
+			fmt.Println("  Maintenance-mode endpoint not responding — proceeding to gRPC readiness check.")
+		}
+	}
+
+	// Step 3: Wait for CA-verified gRPC API (worker auto-joins cluster via token).
+	fmt.Println("  Waiting for worker Talos gRPC API to be ready (up to 35 minutes)...")
+	if err := b.waitForTalosctlReady(talosctlPath, opts.TalosConfigFile, opts.Host, opts.WorkerCfgFile, certSANsPatch); err != nil {
+		return fmt.Errorf("waiting for worker Talos after config apply: %w", err)
 	}
 
 	return nil
@@ -265,7 +333,11 @@ func (b *Bootstrapper) probeMaintenanceMode(talosctlPath, talosConfigFile, host 
 // succeeds.  It tracks port-50000 transitions to detect reboots, retries
 // apply-config when Talos stays in maintenance mode too long, and emits
 // diagnostic logs on every relevant event.
-func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host, controlPlaneCfg string) error {
+//
+// configPatch is an optional YAML strategic-merge patch applied to every
+// apply-config call (e.g. to inject machine.certSANs for cloud instances
+// where the public IP is not on any interface).  Pass "" for no patch.
+func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host, controlPlaneCfg, configPatch string) error {
 	s := spinner.New(spinner.CharSets[14], 200*time.Millisecond)
 	s.Suffix = " Waiting for Talos gRPC API (CA-verified)..."
 	s.Start()
@@ -428,12 +500,16 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 					return time.Since(port50kUpSince).Round(time.Second).String()
 				}())
 
-			applyOut, applyErr := b.runTalosctlInsecureWithOutput(talosctlPath,
+			applyArgs := []string{
 				"apply-config",
 				"--nodes", host,
 				"--endpoints", host,
 				"--file", controlPlaneCfg,
-			)
+			}
+			if configPatch != "" {
+				applyArgs = append(applyArgs, "--patch", configPatch)
+			}
+			applyOut, applyErr := b.runTalosctlInsecureWithOutput(talosctlPath, applyArgs...)
 			if applyErr != nil {
 				color.Yellow("  apply-config retry %d FAILED: %v\n", applyRetryCount, summariseError(applyErr))
 				if applyOut != "" {
