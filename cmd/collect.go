@@ -64,15 +64,12 @@ func runCollect(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("collecting k3s info: %w", err)
 	}
 
-	// SQLite guard — same logic as migrate.go.
-	if info.DatastoreType == "sqlite" && info.ClusterType != "kubeadm" {
-		if !flagCollectMigrateToEtcd {
-			return fmt.Errorf(
-				"k3s is using SQLite as its datastore.\n\n" +
-					"An etcd backup cannot be taken from a SQLite cluster.  Run with\n" +
-					"--migrate-to-etcd to convert the datastore to embedded etcd first,\n" +
-					"or use this backup only for the YAML resource export (resources/ dir).")
-		}
+	// If the cluster is using SQLite and --migrate-to-etcd is set, convert
+	// before taking the backup so we get a proper etcd snapshot.
+	// Without the flag, collect still works: it backs up state.db and the
+	// YAML resource export.  (The etcd snapshot is only required for Talos
+	// restore; migrate.go enforces that separately.)
+	if info.DatastoreType == "sqlite" && info.ClusterType != "kubeadm" && flagCollectMigrateToEtcd {
 		if err := k3s.MigrateToEtcd(sshClient); err != nil {
 			return fmt.Errorf("converting k3s to embedded etcd: %w", err)
 		}
