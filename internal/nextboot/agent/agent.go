@@ -5,6 +5,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -349,12 +350,25 @@ func ensureTool(name string) error {
 		pkg = p
 	}
 	log("%s not found — installing package %s via apt-get...", name, pkg)
-	// Use a 120-second lock timeout so we fail fast with a clear error rather
-	// than hanging indefinitely if unattended-upgrades holds the apt lock.
-	if out, err := exec.Command("apt-get", "install", "-y", "-q",
+	return aptInstall(pkg)
+}
+
+// aptInstall runs apt-get install with a 3-minute deadline and explicit
+// network + lock timeouts so it never hangs indefinitely.
+func aptInstall(pkg string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "apt-get", "install", "-y", "-q",
+		"--no-install-recommends",
 		"-o", "DPkg::Lock::Timeout=120",
-		pkg).CombinedOutput(); err != nil {
-		return fmt.Errorf("installing %s (package %s): %w\n%s", name, pkg, err, string(out))
+		"-o", "Acquire::http::Timeout=30",
+		"-o", "Acquire::Retries=2",
+		pkg).CombinedOutput()
+	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("apt-get install %s timed out after 3 minutes — check network connectivity", pkg)
+		}
+		return fmt.Errorf("apt-get install %s: %w\n%s", pkg, err, string(out))
 	}
 	return nil
 }
@@ -532,8 +546,8 @@ func writeConfig(disk string, config []byte) error {
 		log("STATE partition is unformatted — creating XFS filesystem (label STATE)...")
 		// Ensure mkfs.xfs is available.
 		if _, lookErr := exec.LookPath("mkfs.xfs"); lookErr != nil {
-			if out2, aptErr := exec.Command("apt-get", "install", "-y", "-q", "xfsprogs").CombinedOutput(); aptErr != nil {
-				return fmt.Errorf("installing xfsprogs for mkfs.xfs: %w\n%s", aptErr, string(out2))
+			if aptErr := aptInstall("xfsprogs"); aptErr != nil {
+				return fmt.Errorf("installing xfsprogs for mkfs.xfs: %w", aptErr)
 			}
 		}
 		// Use label "STATE" — Talos identifies the STATE partition by this XFS
