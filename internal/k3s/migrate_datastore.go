@@ -37,8 +37,11 @@ func MigrateToEtcd(sshClient *ssh.Client) error {
 		if _, err := sshClient.Run("mkdir -p /etc/rancher/k3s"); err != nil {
 			return fmt.Errorf("creating k3s config directory: %w", err)
 		}
+		// Wrap in sh -c so the >> redirection runs as root, not as the SSH
+		// user.  A bare `sudo echo ... >> file` fails because the shell opens
+		// the file before sudo elevates privileges.
 		if _, err := sshClient.Run(
-			fmt.Sprintf("echo 'cluster-init: true' >> %s", k3sCfg),
+			`sh -c 'echo "cluster-init: true" >> /etc/rancher/k3s/config.yaml'`,
 		); err != nil {
 			return fmt.Errorf("writing cluster-init to k3s config: %w", err)
 		}
