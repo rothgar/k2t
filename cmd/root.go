@@ -1,8 +1,12 @@
 package cmd
 
 import (
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 
+	sshconfig "github.com/kevinburke/ssh_config"
 	"github.com/rothgar/k3s-to-talos/internal/ssh"
 	"github.com/spf13/cobra"
 )
@@ -29,7 +33,10 @@ Talos Linux.
 The SSH target accepts standard SSH notation: [user@]host
 
   k2t migrate ubuntu@10.1.1.1
-  k2t migrate --host ubuntu@10.1.1.1
+  k2t migrate myserver           # resolves via ~/.ssh/config
+
+Host aliases, users, ports, and identity files are automatically read from
+~/.ssh/config. Command-line flags take precedence over the config file.
 
 When the SSH user is not "root", sudo is used automatically for privileged
 commands.
@@ -53,32 +60,113 @@ func resolveTarget(args []string) string {
 	return flagHost
 }
 
-// sshOpts parses a [user@]host target string and returns ssh.Options.
-// Sudo is auto-detected by ssh.NewClient based on the resolved user.
+// sshOpts parses a [user@]host target string and returns ssh.Options,
+// filling in missing values from ~/.ssh/config.
+//
+// Resolution order (highest to lowest priority):
+//
+//	user    : inline user@host  >  ssh config User  >  "root"
+//	host    : ssh config Hostname (alias resolution)
+//	port    : --ssh-port flag   >  ssh config Port  >  22
+//	key     : --ssh-key flag    >  ssh config IdentityFile
 func sshOpts(target string) ssh.Options {
-	user := "root"
-	host := target
+	user := ""
+	alias := target // the name the user typed (may be a Host alias)
 	if idx := strings.Index(target, "@"); idx >= 0 {
 		user = target[:idx]
-		host = target[idx+1:]
+		alias = target[idx+1:]
 	}
+
+	cfg := loadSSHConfig()
+
+	// Resolve hostname alias → actual IP/FQDN.
+	host := alias
+	if resolved := cfg.get(alias, "Hostname"); resolved != "" {
+		host = resolved
+	}
+
+	// User: inline > ssh config > "root"
+	if user == "" {
+		if u := cfg.get(alias, "User"); u != "" {
+			user = u
+		} else {
+			user = "root"
+		}
+	}
+
+	// Port: --ssh-port (non-zero means explicitly set) > ssh config > 22
+	port := flagSSHPort
+	if port == 0 {
+		if p := cfg.get(alias, "Port"); p != "" {
+			if n, err := strconv.Atoi(p); err == nil {
+				port = n
+			}
+		}
+		if port == 0 {
+			port = 22
+		}
+	}
+
+	// Key: --ssh-key > ssh config IdentityFile > (NewClient tries defaults)
+	keyPath := flagSSHKey
+	if keyPath == "" {
+		keyPath = cfg.get(alias, "IdentityFile")
+	}
+
 	return ssh.Options{
 		Host:    host,
-		Port:    flagSSHPort,
+		Port:    port,
 		User:    user,
-		KeyPath: flagSSHKey,
+		KeyPath: keyPath,
 	}
 }
 
-// resolveHost returns just the host portion of a [user@]host target.
+// resolveHost returns just the host portion of a [user@]host target,
+// after applying ~/.ssh/config alias resolution.
 func resolveHost(args []string) string {
 	return sshOpts(resolveTarget(args)).Host
 }
 
+// sshCfg wraps a parsed ssh_config.Config for safe nil-safe lookups.
+type sshCfg struct{ cfg *sshconfig.Config }
+
+func (c *sshCfg) get(alias, key string) string {
+	if c.cfg == nil {
+		return ""
+	}
+	v, _ := c.cfg.Get(alias, key)
+	// Expand ~/ in paths (the library does this for system-level Get but not
+	// when decoding from a reader).
+	if strings.HasPrefix(v, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			v = filepath.Join(home, v[2:])
+		}
+	}
+	return v
+}
+
+// loadSSHConfig reads ~/.ssh/config, returning an empty reader on any error.
+func loadSSHConfig() *sshCfg {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return &sshCfg{}
+	}
+	f, err := os.Open(filepath.Join(home, ".ssh", "config"))
+	if err != nil {
+		return &sshCfg{} // no config file is fine
+	}
+	defer f.Close()
+	cfg, err := sshconfig.Decode(f)
+	if err != nil {
+		return &sshCfg{} // malformed config — ignore silently
+	}
+	return &sshCfg{cfg: cfg}
+}
+
 func init() {
-	rootCmd.PersistentFlags().StringVar(&flagHost, "host", "", "SSH target: [user@]host (e.g. ubuntu@10.1.1.1)")
-	rootCmd.PersistentFlags().StringVar(&flagSSHKey, "ssh-key", "", "Path to SSH private key (defaults to ~/.ssh/id_rsa)")
-	rootCmd.PersistentFlags().IntVar(&flagSSHPort, "ssh-port", 22, "SSH port")
+	rootCmd.PersistentFlags().StringVar(&flagHost, "host", "", "SSH target: [user@]host (e.g. ubuntu@10.1.1.1 or a ~/.ssh/config alias)")
+	rootCmd.PersistentFlags().StringVar(&flagSSHKey, "ssh-key", "", "Path to SSH private key (overrides ~/.ssh/config IdentityFile)")
+	rootCmd.PersistentFlags().IntVar(&flagSSHPort, "ssh-port", 0, "SSH port (overrides ~/.ssh/config Port; default 22)")
 	rootCmd.PersistentFlags().StringVar(&flagBackupDir, "backup-dir", "./k3s-backup", "Local directory for backups and generated configs")
 
 	rootCmd.AddCommand(migrateCmd)
