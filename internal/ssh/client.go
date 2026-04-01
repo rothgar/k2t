@@ -13,6 +13,7 @@ import (
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/term"
 )
@@ -323,11 +324,22 @@ func formatDialError(host, addr string, err error) error {
 	return fmt.Errorf("connecting to %s: %w", addr, err)
 }
 
-// buildAuthMethods constructs SSH auth methods: key-based first, password fallback.
+// buildAuthMethods constructs SSH auth methods in priority order:
+//  1. SSH agent (SSH_AUTH_SOCK) — handles passphrase-protected keys transparently
+//  2. Key file (explicit path or common defaults) — for keys not in the agent
+//  3. Password prompt — last resort fallback
 func buildAuthMethods(keyPath string) ([]ssh.AuthMethod, error) {
 	var methods []ssh.AuthMethod
 
-	// 1. Try the provided key path, then common defaults.
+	// 1. SSH agent — try first so passphrase-protected keys work without
+	//    the tool needing to decrypt them directly.
+	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+		if conn, err := net.Dial("unix", sock); err == nil {
+			methods = append(methods, ssh.PublicKeysCallback(agent.NewClient(conn).Signers))
+		}
+	}
+
+	// 2. Key file: explicit path first, then common defaults.
 	candidates := []string{}
 	if keyPath != "" {
 		candidates = append(candidates, keyPath)
@@ -336,7 +348,6 @@ func buildAuthMethods(keyPath string) ([]ssh.AuthMethod, error) {
 	for _, name := range []string{"id_ed25519", "id_rsa", "id_ecdsa"} {
 		candidates = append(candidates, filepath.Join(home, ".ssh", name))
 	}
-
 	for _, p := range candidates {
 		if signer, err := loadPrivateKey(p); err == nil {
 			methods = append(methods, ssh.PublicKeys(signer))
@@ -344,7 +355,7 @@ func buildAuthMethods(keyPath string) ([]ssh.AuthMethod, error) {
 		}
 	}
 
-	// 2. Password fallback.
+	// 3. Password fallback.
 	methods = append(methods, ssh.PasswordCallback(func() (string, error) {
 		fmt.Printf("SSH password for %s: ", keyPath)
 		pw, err := term.ReadPassword(int(os.Stdin.Fd()))
