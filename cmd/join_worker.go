@@ -41,7 +41,7 @@ This process is IRREVERSIBLE. The worker node's OS will be erased.`,
 }
 
 func init() {
-	joinWorkerCmd.Flags().StringVar(&flagWorkerTalosVersion, "talos-version", "v1.7.0", "Talos Linux version to install")
+	joinWorkerCmd.Flags().StringVar(&flagWorkerTalosVersion, "talos-version", "v1.12.6", "Talos Linux version to install")
 	joinWorkerCmd.Flags().StringVar(&flagWorkerConfig, "worker-config", "", "Path to worker.yaml from the control plane migration (required)")
 	joinWorkerCmd.Flags().StringVar(&flagTalosConfig, "talosconfig", "", "Path to talosconfig from the control plane migration (required)")
 	_ = joinWorkerCmd.MarkFlagRequired("worker-config")

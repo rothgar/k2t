@@ -83,7 +83,7 @@ ssh -i /tmp/k3s-to-talos-test-<PID>/ci_key -p 10022 ubuntu@127.0.0.1
 
 **Talos version override:**
 ```bash
-./hack/local-test.sh --talos-version v1.9.0 k3s-single
+./hack/local-test.sh --talos-version v1.12.6 k3s-single
 ```
 
 **Use a pre-built binary:**

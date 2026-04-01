@@ -31,7 +31,7 @@ func init() {
 		"Control plane endpoint IP or hostname (required if --host not set)")
 	generateCmd.Flags().StringVar(&flagGenerateClusterName, "cluster-name", "talos-cluster",
 		"Name for the Talos cluster")
-	generateCmd.Flags().StringVar(&flagGenerateTalosVersion, "talos-version", "v1.7.0",
+	generateCmd.Flags().StringVar(&flagGenerateTalosVersion, "talos-version", "v1.12.6",
 		"Talos Linux version to target")
 }
 

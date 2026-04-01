@@ -183,7 +183,7 @@ jobs:
             --ssh-key "$HOME/.ssh/id_ed25519" \
             --backup-dir ./dry-run-backup \
             --cluster-name ci-test \
-            --talos-version v1.7.0 \
+            --talos-version v1.12.6 \
             --dry-run
 
       - name: Verify dry-run output

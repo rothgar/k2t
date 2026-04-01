@@ -44,7 +44,7 @@ This process is IRREVERSIBLE. The target machine's OS will be erased.`,
 }
 
 func init() {
-	migrateCmd.Flags().StringVar(&flagTalosVersion, "talos-version", "v1.7.0", "Talos Linux version to install")
+	migrateCmd.Flags().StringVar(&flagTalosVersion, "talos-version", "v1.12.6", "Talos Linux version to install")
 	migrateCmd.Flags().StringVar(&flagClusterName, "cluster-name", "", "Name for the Talos cluster (defaults to the k3s cluster name or 'talos-cluster')")
 	migrateCmd.Flags().BoolVar(&flagDryRun, "dry-run", false, "Collect info and show what would happen, but do not modify the remote machine")
 	migrateCmd.Flags().BoolVar(&flagResume, "resume", false, "Resume a previously interrupted migration from the last completed phase")
