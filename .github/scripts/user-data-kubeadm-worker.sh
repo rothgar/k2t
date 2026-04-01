@@ -1,5 +1,7 @@
 #!/bin/bash
-# cloud-init user-data: install kubeadm and initialise a single-node cluster.
+# cloud-init user-data: install kubeadm prerequisites on a worker node.
+# Does NOT run kubeadm init or join — the join command is delivered via SSH
+# after the control plane is ready.
 set -euo pipefail
 
 # Set up SSH key for the ubuntu user immediately so the runner can connect
@@ -58,33 +60,4 @@ apt-mark hold kubelet kubeadm kubectl
 
 systemctl enable kubelet
 
-# ── Cluster initialisation ─────────────────────────────────────────────────────
-ADVERTISE_IP=$(hostname -I | awk '{print $1}')
-
-kubeadm init \
-  --apiserver-advertise-address="${ADVERTISE_IP}" \
-  --pod-network-cidr=10.244.0.0/16 \
-  --cri-socket=unix:///run/containerd/containerd.sock \
-  --ignore-preflight-errors=NumCPU
-
-# Copy admin config for root kubectl use.
-mkdir -p /root/.kube
-cp /etc/kubernetes/admin.conf /root/.kube/config
-
-# Always use the admin kubeconfig explicitly so the env is independent of
-# $HOME (cloud-init may run with HOME != /root, causing kubectl to fall back
-# to the unauthenticated http://localhost:8080 endpoint).
-export KUBECONFIG=/etc/kubernetes/admin.conf
-
-# Allow scheduling on the control-plane node (single-node cluster).
-kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
-
-# Install Flannel CNI.
-kubectl apply -f \
-  https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
-
-# Wait for the node to become Ready (up to 10 minutes).
-timeout 600 bash -c \
-  'until kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes 2>/dev/null | grep -q " Ready"; do sleep 5; done'
-
-echo "kubeadm installation complete: $(kubelet --version)"
+echo "kubeadm worker prerequisites installed: $(kubelet --version)"

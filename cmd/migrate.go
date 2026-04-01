@@ -1,9 +1,13 @@
 package cmd
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/fatih/color"
 	"github.com/rothgar/k3s-to-talos/internal/k3s"
@@ -15,10 +19,12 @@ import (
 )
 
 var (
-	flagTalosVersion string
-	flagClusterName  string
-	flagDryRun       bool
-	flagResume       bool
+	flagTalosVersion    string
+	flagClusterName     string
+	flagDryRun          bool
+	flagResume          bool
+	flagYes             bool
+	flagMigrateToEtcd   bool
 )
 
 var migrateCmd = &cobra.Command{
@@ -42,6 +48,8 @@ func init() {
 	migrateCmd.Flags().StringVar(&flagClusterName, "cluster-name", "", "Name for the Talos cluster (defaults to the k3s cluster name or 'talos-cluster')")
 	migrateCmd.Flags().BoolVar(&flagDryRun, "dry-run", false, "Collect info and show what would happen, but do not modify the remote machine")
 	migrateCmd.Flags().BoolVar(&flagResume, "resume", false, "Resume a previously interrupted migration from the last completed phase")
+	migrateCmd.Flags().BoolVar(&flagYes, "yes", false, "Skip the interactive confirmation prompt (for CI/automation)")
+	migrateCmd.Flags().BoolVar(&flagMigrateToEtcd, "migrate-to-etcd", false, "Automatically convert the k3s SQLite datastore to embedded etcd before backup (requires k3s restart)")
 }
 
 func runMigrate(cmd *cobra.Command, args []string) error {
@@ -72,6 +80,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 			Port:    flagSSHPort,
 			User:    flagSSHUser,
 			KeyPath: flagSSHKey,
+			Sudo:    flagSudo,
 		})
 		if err != nil {
 			return fmt.Errorf("SSH connection failed: %w", err)
@@ -85,6 +94,43 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		info, err := collector.Collect()
 		if err != nil {
 			return fmt.Errorf("collecting k3s info: %w", err)
+		}
+
+		// ── SQLite guard ─────────────────────────────────────────────────────
+		// Talos bootstrap uses etcd snapshot restore; there is no SQLite→etcd
+		// conversion path in Talos.  Block the migration unless the user passes
+		// --migrate-to-etcd to convert the datastore automatically first.
+		if info.DatastoreType == "sqlite" && info.ClusterType != "kubeadm" {
+			if flagDryRun {
+				// In dry-run mode just warn — no machine changes are made so the
+				// guard is informational only.
+				color.Yellow("\n  ⚠ WARNING: k3s is using SQLite.  A real migration requires\n")
+				color.Yellow("    --migrate-to-etcd to convert to embedded etcd first.\n\n")
+			} else if !flagMigrateToEtcd {
+				return fmt.Errorf(
+					"k3s is using SQLite as its datastore, but Talos requires etcd.\n\n" +
+						"The etcd snapshot restore path used to preserve your workloads only\n" +
+						"works when k3s is running with embedded etcd.\n\n" +
+						"Re-run with --migrate-to-etcd to automatically convert the datastore\n" +
+						"to embedded etcd before taking the backup.  k3s will be restarted —\n" +
+						"expect a brief API downtime (~30 s).")
+			} else {
+				if err := k3s.MigrateToEtcd(sshClient); err != nil {
+					return fmt.Errorf("converting k3s to embedded etcd: %w", err)
+				}
+				// Re-collect after the datastore migration so info reflects the new state.
+				collector2, err2 := k3s.Detect(sshClient)
+				if err2 != nil {
+					return fmt.Errorf("re-detecting cluster type after etcd migration: %w", err2)
+				}
+				info, err = collector2.Collect()
+				if err != nil {
+					return fmt.Errorf("re-collecting cluster info after etcd migration: %w", err)
+				}
+				if info.DatastoreType != "etcd" {
+					return fmt.Errorf("k3s still reports SQLite after --cluster-init migration; check k3s logs")
+				}
+			}
 		}
 
 		backup := k3s.NewBackup(sshClient, flagBackupDir, flagHost)
@@ -116,10 +162,12 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 
 	ui.PrintIrreversibilityWarning(flagHost)
 
-	if !flagDryRun {
+	if !flagDryRun && !flagYes {
 		if err := ui.ConfirmErase(flagHost); err != nil {
 			return err
 		}
+	} else if flagYes {
+		color.Yellow("[--yes] Skipping confirmation prompt.\n")
 	} else {
 		color.Yellow("[DRY RUN] Skipping confirmation prompt.\n")
 	}
@@ -137,13 +185,27 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		}
 
 		talosConfigDir := filepath.Join(flagBackupDir, "talos-config")
+		// For kubeadm, the Flannel DaemonSet from etcd restore runs in the
+		// kube-flannel namespace.  If Talos also installs Flannel (default CNI),
+		// two competing daemons both try to configure the flannel.1 VXLAN
+		// interface, breaking pod networking.  Set CNI to "none" so Talos
+		// defers entirely to the kubeadm Flannel restored from etcd.
+		var cniName string
+		if state.ClusterInfo.ClusterType == k3s.ClusterTypeKubeadm {
+			cniName = "none"
+		}
+
 		gen := talos.NewConfigGenerator(flagBackupDir)
 		if err := gen.Generate(talos.GenerateOptions{
-			ClusterName:    clusterName,
-			ControlPlaneIP: flagHost,
-			TalosVersion:   flagTalosVersion,
-			OutputDir:      talosConfigDir,
-			DryRun:         flagDryRun,
+			ClusterName:                   clusterName,
+			ControlPlaneIP:                flagHost,
+			TalosVersion:                  flagTalosVersion,
+			OutputDir:                     talosConfigDir,
+			DryRun:                        flagDryRun,
+			PodCIDR:                       state.ClusterInfo.PodCIDR,
+			ServiceCIDR:                   state.ClusterInfo.ServiceCIDR,
+			AllowSchedulingOnControlPlane: state.ClusterInfo.AllowSchedulingOnControlPlane,
+			CNIName:                       cniName,
 		}); err != nil {
 			return fmt.Errorf("generating Talos config: %w", err)
 		}
@@ -174,6 +236,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 			Port:    flagSSHPort,
 			User:    flagSSHUser,
 			KeyPath: flagSSHKey,
+			Sudo:    flagSudo,
 		})
 		if err != nil {
 			return fmt.Errorf("reconnecting via SSH: %w", err)
@@ -210,12 +273,22 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		controlPlaneCfg := filepath.Join(state.TalosConfigDir, "controlplane.yaml")
 		kubeconfigOut := filepath.Join(flagBackupDir, "talos-kubeconfig")
 
+		// Use etcd recover (from k3s snapshot) instead of bootstrap when available.
+		// Require the file to be at least 1 KiB — a truncated/partial file left
+		// by a failed SFTP download would otherwise fool talosctl into accepting
+		// it, causing bootstrap --recover-from to fail with a cryptic error.
+		snapshotPath := filepath.Join(flagBackupDir, "database", "etcd-snapshot.db")
+		if fi, err := os.Stat(snapshotPath); err != nil || fi.Size() < 1024 {
+			snapshotPath = "" // missing or too small — fall back to standard bootstrap
+		}
+
 		bootstrapper := talos.NewBootstrapper(flagBackupDir)
 		if err := bootstrapper.Bootstrap(talos.BootstrapOptions{
-			Host:            flagHost,
-			TalosConfigFile: talosConfigFile,
-			ControlPlaneCfg: controlPlaneCfg,
-			KubeconfigOut:   kubeconfigOut,
+			Host:             flagHost,
+			TalosConfigFile:  talosConfigFile,
+			ControlPlaneCfg:  controlPlaneCfg,
+			KubeconfigOut:    kubeconfigOut,
+			EtcdSnapshotPath: snapshotPath,
 		}); err != nil {
 			return fmt.Errorf("bootstrapping Talos cluster: %w", err)
 		}
@@ -225,6 +298,12 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		if err := state.Save(stateFile); err != nil {
 			return fmt.Errorf("saving state: %w", err)
 		}
+
+		// Apply backed-up Kubernetes resources to the new cluster.
+		// This is the primary restore path when etcd recovery failed or was
+		// skipped; it also acts as a safety net after a successful etcd restore
+		// (idempotent — objects that already exist are left unchanged).
+		applyResourcesFromBackup(filepath.Join(flagBackupDir, "resources"), kubeconfigOut)
 	} else {
 		ui.PrintPhaseSkipped(5, "BOOTSTRAP", "already completed")
 	}
@@ -232,6 +311,58 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	// ─── Done ────────────────────────────────────────────────────────────────
 	printMigrationSuccess(state)
 	return nil
+}
+
+// applyResourcesFromBackup applies the YAML files saved during the collect
+// phase to the new Talos cluster.  It retries for up to 3 minutes to give the
+// Kubernetes API server time to become fully ready after bootstrap.
+// Errors are non-fatal — a warning is printed but migration still succeeds.
+func applyResourcesFromBackup(resourcesDir, kubeconfig string) {
+	if _, err := os.Stat(resourcesDir); err != nil {
+		return // no backup directory
+	}
+	kubectlPath, err := exec.LookPath("kubectl")
+	if err != nil {
+		color.Yellow("  Note: kubectl not found in PATH; skipping resource restore from backup.\n")
+		color.Yellow("  To restore manually: kubectl apply -f %s --recursive\n", resourcesDir)
+		return
+	}
+
+	fmt.Printf("  Applying backed-up resources from %s (retrying up to 3 min)...\n", resourcesDir)
+
+	deadline := time.Now().Add(3 * time.Minute)
+	wait := 5 * time.Second
+	for time.Now().Before(deadline) {
+		var out bytes.Buffer
+		cmd := exec.Command(kubectlPath,
+			"--kubeconfig", kubeconfig,
+			"apply",
+			"-f", resourcesDir,
+			"--recursive",
+		)
+		cmd.Stdout = &out
+		cmd.Stderr = &out
+
+		if err := cmd.Run(); err == nil {
+			color.Green("  ✓ Backed-up resources applied to Talos cluster\n")
+			return
+		}
+
+		outStr := strings.TrimSpace(out.String())
+		// If it's just "no objects passed to apply" the directory has no YAML —
+		// that's not an error worth retrying.
+		if strings.Contains(outStr, "no objects passed to apply") ||
+			strings.Contains(outStr, "the path") {
+			color.Yellow("  Note: no resources found in %s to apply.\n", resourcesDir)
+			return
+		}
+		time.Sleep(wait)
+		if wait < 30*time.Second {
+			wait *= 2
+		}
+	}
+	color.Yellow("  Warning: could not apply backed-up resources within 3 minutes.\n")
+	color.Yellow("  To restore manually: kubectl apply -f %s --recursive\n", resourcesDir)
 }
 
 func printMigrationSuccess(state *MigrationState) {

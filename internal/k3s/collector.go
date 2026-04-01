@@ -3,6 +3,7 @@ package k3s
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -24,6 +25,14 @@ type ClusterInfo struct {
 	PVCount       int                 `json:"pv_count"`
 	PVs           []PV                `json:"pvs,omitempty"`
 	Hardware      *talos.HardwareInfo `json:"hardware,omitempty"`
+	PodCIDR       string              `json:"pod_cidr,omitempty"`     // cluster pod CIDR
+	ServiceCIDR   string              `json:"service_cidr,omitempty"` // cluster service CIDR
+	// AllowSchedulingOnControlPlane is true when the source cluster's control-plane
+	// nodes are schedulable (i.e. none of them carry the
+	// node-role.kubernetes.io/control-plane:NoSchedule taint). The Talos config
+	// generator uses this to set cluster.allowSchedulingOnControlPlane so the
+	// generated cluster has identical scheduling behaviour.
+	AllowSchedulingOnControlPlane bool `json:"allow_scheduling_on_control_plane"`
 }
 
 // Node represents a Kubernetes node in the k3s cluster.
@@ -122,6 +131,9 @@ func (c *Collector) Collect() (*ClusterInfo, error) {
 		fmt.Printf("\nWarning: could not collect PV info: %v\n", err)
 	}
 
+	s.Suffix = " Detecting cluster network CIDRs..."
+	c.detectNetworkCIDRs(info)
+
 	return info, nil
 }
 
@@ -197,6 +209,12 @@ func (c *Collector) collectNodes(info *ClusterInfo) error {
 				Name   string            `json:"name"`
 				Labels map[string]string `json:"labels"`
 			} `json:"metadata"`
+			Spec struct {
+				Taints []struct {
+					Key    string `json:"key"`
+					Effect string `json:"effect"`
+				} `json:"taints"`
+			} `json:"spec"`
 			Status struct {
 				Conditions []struct {
 					Type   string `json:"type"`
@@ -213,6 +231,10 @@ func (c *Collector) collectNodes(info *ClusterInfo) error {
 	if err := json.Unmarshal([]byte(out), &nodeList); err != nil {
 		return fmt.Errorf("parsing node list: %w", err)
 	}
+
+	// Track whether any control-plane node carries the NoSchedule taint.
+	cpNoScheduleCount := 0
+	cpCount := 0
 
 	for _, item := range nodeList.Items {
 		node := Node{Name: item.Metadata.Name}
@@ -252,7 +274,24 @@ func (c *Collector) collectNodes(info *ClusterInfo) error {
 			}
 		}
 
+		if node.IsControlPlane {
+			cpCount++
+			for _, t := range item.Spec.Taints {
+				if t.Key == "node-role.kubernetes.io/control-plane" && t.Effect == "NoSchedule" {
+					cpNoScheduleCount++
+					break
+				}
+			}
+		}
+
 		info.Nodes = append(info.Nodes, node)
+	}
+
+	// allowSchedulingOnControlPlane = true when there are control-plane nodes
+	// AND none of them carry the NoSchedule taint (i.e. the source cluster
+	// allows scheduling on the control plane).
+	if cpCount > 0 && cpNoScheduleCount == 0 {
+		info.AllowSchedulingOnControlPlane = true
 	}
 
 	return nil
@@ -330,4 +369,64 @@ func (c *Collector) collectPVs(info *ClusterInfo) error {
 	}
 	info.PVCount = len(info.PVs)
 	return nil
+}
+
+// detectNetworkCIDRs attempts to discover the cluster-wide pod and service CIDRs.
+//
+// Pod CIDR:     read from the first node's spec.podCIDR and expand it to the
+//               cluster-level prefix.  k3s allocates /24 per node from a /16,
+//               so we expand the /24 to its containing /16.
+// Service CIDR: not exposed via the Kubernetes API; we default to the k3s
+//               default (10.43.0.0/16) which is correct for the vast majority
+//               of k3s installations.
+//
+// Falls back to k3s defaults (10.42.0.0/16 / 10.43.0.0/16) when detection fails.
+func (c *Collector) detectNetworkCIDRs(info *ClusterInfo) {
+	const defaultPodCIDR     = "10.42.0.0/16"
+	const defaultServiceCIDR = "10.43.0.0/16"
+
+	// ── Pod CIDR ──────────────────────────────────────────────────────────────
+	out, err := c.ssh.Run(c.kubectlBin() +
+		" get nodes -o jsonpath='{.items[0].spec.podCIDR}' 2>/dev/null")
+	nodeCIDR := strings.TrimSpace(strings.Trim(out, "'"))
+	if err == nil && nodeCIDR != "" {
+		_, ipnet, parseErr := net.ParseCIDR(nodeCIDR)
+		if parseErr == nil {
+			ones, bits := ipnet.Mask.Size()
+			_ = bits
+			// Expand the per-node subnet to the cluster-level CIDR.
+			// k3s allocates /24 per node from a /16; for other prefixes keep as-is.
+			if ones >= 16 {
+				// Mask to the /16 containing this subnet.
+				clusterMask := net.CIDRMask(16, 32)
+				clusterIP := ipnet.IP.Mask(clusterMask)
+				info.PodCIDR = fmt.Sprintf("%s/16", clusterIP.String())
+			} else {
+				info.PodCIDR = ipnet.String()
+			}
+		}
+	}
+	if info.PodCIDR == "" {
+		info.PodCIDR = defaultPodCIDR
+	}
+
+	// ── Service CIDR ──────────────────────────────────────────────────────────
+	// For kubeadm, read --service-cluster-ip-range from the kube-apiserver
+	// static-pod manifest.  The kubeadm default (10.96.0.0/12) differs from
+	// the k3s default (10.43.0.0/16); using the wrong value causes existing
+	// ClusterIP services (kubernetes.default, kube-dns) to be unreachable.
+	if c.clusterType == ClusterTypeKubeadm {
+		const defaultKubeadmServiceCIDR = "10.96.0.0/12"
+		out, _ := c.ssh.Run(
+			`grep -o -- '--service-cluster-ip-range=[^ "]*' ` +
+				`/etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null | cut -d= -f2`)
+		cidr := strings.TrimSpace(strings.Trim(out, "'"))
+		if cidr != "" {
+			info.ServiceCIDR = cidr
+		} else {
+			info.ServiceCIDR = defaultKubeadmServiceCIDR
+		}
+		return
+	}
+	info.ServiceCIDR = defaultServiceCIDR
 }

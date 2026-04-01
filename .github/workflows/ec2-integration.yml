@@ -13,8 +13,9 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: us-west-2
   INSTANCE_TYPE: t3.medium
+  TALOS_VERSION: v1.12.6
 
 jobs:
   # ── Build binary once, share as artifact ──────────────────────────────────────
@@ -27,21 +28,19 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: go build -o k3s-to-talos .
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o k3s-to-talos .
       - uses: actions/upload-artifact@v4
         with:
           name: k3s-to-talos-binary
           path: k3s-to-talos
           retention-days: 1
 
-  # ── Resolve AMI IDs once so the matrix jobs don't each call SSM ───────────────
+  # ── Resolve Ubuntu AMI ID ──────────────────────────────────────────────────────
   resolve-amis:
     name: Resolve AMI IDs
     runs-on: ubuntu-latest
     outputs:
-      ubuntu-2204: ${{ steps.amis.outputs.ubuntu-2204 }}
       ubuntu-2404: ${{ steps.amis.outputs.ubuntu-2404 }}
-      debian-12:   ${{ steps.amis.outputs.debian-12   }}
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -52,64 +51,21 @@ jobs:
       - name: Resolve AMI IDs via SSM
         id: amis
         run: |
-          u22=$(aws ssm get-parameter \
-            --name /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id \
-            --query 'Parameter.Value' --output text)
-          echo "ubuntu-2204=$u22" >> "$GITHUB_OUTPUT"
-
           u24=$(aws ssm get-parameter \
             --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
             --query 'Parameter.Value' --output text)
           echo "ubuntu-2404=$u24" >> "$GITHUB_OUTPUT"
+          echo "Resolved ubuntu-24.04 AMI: $u24"
 
-          # Debian publishes AMIs via their own SSM namespace.
-          deb12=$(aws ssm get-parameter \
-            --name /aws/service/debian/release/bookworm/latest/amd64 \
-            --query 'Parameter.Value' --output text 2>/dev/null) || \
-          deb12=$(aws ec2 describe-images \
-            --owners 136693071363 \
-            --filters "Name=name,Values=debian-12-amd64-*" "Name=state,Values=available" \
-            --query "sort_by(Images,&CreationDate)[-1].ImageId" --output text)
-          echo "debian-12=$deb12" >> "$GITHUB_OUTPUT"
-
-          echo "Resolved AMIs: ubuntu-22.04=$u22  ubuntu-24.04=$u24  debian-12=$deb12"
-
-  # ── Matrix: distro × cluster type ─────────────────────────────────────────────
+  # ── End-to-end k3s → Talos migration test ─────────────────────────────────────
+  # Flow: Ubuntu k3s instance → nextboot-talos.py converts OS in-place →
+  #       same instance reboots into Talos → etcd restore from k3s snapshot →
+  #       verify workload survived migration
   ec2-test:
-    name: ${{ matrix.cluster }} on ${{ matrix.distro }}
+    name: k3s → Talos migration
     needs: [build, resolve-amis]
     runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false   # let other cells finish even if one fails
-      matrix:
-        include:
-          # k3s cells
-          - distro: ubuntu-22.04
-            cluster: k3s
-            ami_key: ubuntu-2204
-            ssh_user: ubuntu
-          - distro: ubuntu-24.04
-            cluster: k3s
-            ami_key: ubuntu-2404
-            ssh_user: ubuntu
-          - distro: debian-12
-            cluster: k3s
-            ami_key: debian-12
-            ssh_user: admin
-          # kubeadm cells
-          - distro: ubuntu-22.04
-            cluster: kubeadm
-            ami_key: ubuntu-2204
-            ssh_user: ubuntu
-          - distro: ubuntu-24.04
-            cluster: kubeadm
-            ami_key: ubuntu-2404
-            ssh_user: ubuntu
-          - distro: debian-12
-            cluster: kubeadm
-            ami_key: debian-12
-            ssh_user: admin
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
@@ -126,53 +82,59 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # ── Generate an ephemeral SSH key pair ──────────────────────────────────
+      # ── Install talosctl (used by the migrate command's bootstrap phase) ───
+      - name: Install talosctl
+        run: |
+          curl -fsSL \
+            "https://github.com/siderolabs/talos/releases/download/${{ env.TALOS_VERSION }}/talosctl-linux-amd64" \
+            -o /usr/local/bin/talosctl
+          chmod +x /usr/local/bin/talosctl
+          talosctl version --client
+
+      # ── Generate an ephemeral SSH key pair ────────────────────────────────
       - name: Generate SSH key pair
         run: |
           ssh-keygen -t ed25519 -f "$HOME/.ssh/ci_key" -N "" -q
           echo "SSH_PUB_KEY=$(cat $HOME/.ssh/ci_key.pub)" >> "$GITHUB_ENV"
 
-      # ── Build and upload user-data (inject public key) ──────────────────────
-      - name: Prepare user-data script
+      # ── Prepare k3s user-data (inject public key) ─────────────────────────
+      - name: Prepare k3s user-data
         run: |
-          script=".github/scripts/user-data-${{ matrix.cluster }}.sh"
-          sed "s|__SSH_PUBLIC_KEY__|${SSH_PUB_KEY}|g" "$script" > /tmp/user-data.sh
-          cat /tmp/user-data.sh   # visible in logs for debugging
+          sed "s|__SSH_PUBLIC_KEY__|${SSH_PUB_KEY}|g" \
+            .github/scripts/user-data-k3s.sh > /tmp/user-data-k3s.sh
 
-      # ── Resolve the AMI ID for this matrix cell ─────────────────────────────
-      - name: Set AMI ID
-        run: |
-          case "${{ matrix.ami_key }}" in
-            ubuntu-2204) echo "AMI_ID=${{ needs.resolve-amis.outputs.ubuntu-2204 }}" >> "$GITHUB_ENV" ;;
-            ubuntu-2404) echo "AMI_ID=${{ needs.resolve-amis.outputs.ubuntu-2404 }}" >> "$GITHUB_ENV" ;;
-            debian-12)   echo "AMI_ID=${{ needs.resolve-amis.outputs.debian-12   }}" >> "$GITHUB_ENV" ;;
-          esac
-
-      # ── Create a per-run security group (SSH from anywhere) ──────────────────
+      # ── Create security group (SSH + Talos API + Kubernetes API) ──────────
+      # Same instance transitions from k3s → Talos, so the SG needs ports
+      # for both: 22 (SSH for k3s phase), 50000 (Talos API), 6443 (kube API).
       - name: Create security group
         id: sg
         run: |
           SG_ID=$(aws ec2 create-security-group \
-            --group-name "k3s-to-talos-ci-${{ github.run_id }}-${{ strategy.job-index }}" \
-            --description "Temporary CI SG for k3s-to-talos run ${{ github.run_id }}" \
+            --group-name "k3s-to-talos-ci-${{ github.run_id }}" \
+            --description "CI migration SG for run ${{ github.run_id }}" \
             --vpc-id "${{ secrets.AWS_VPC_ID }}" \
             --query 'GroupId' --output text)
 
           aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 50000 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 6443 --cidr 0.0.0.0/0
 
           echo "sg-id=$SG_ID" >> "$GITHUB_OUTPUT"
+          echo "Created SG: $SG_ID"
 
-      # ── Launch EC2 instance ──────────────────────────────────────────────────
-      - name: Launch EC2 instance
+      # ── Launch single EC2 instance (Ubuntu / k3s) ─────────────────────────
+      - name: Launch k3s instance
         id: ec2
         run: |
           INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id "$AMI_ID" \
+            --image-id "${{ needs.resolve-amis.outputs.ubuntu-2404 }}" \
             --instance-type "${{ env.INSTANCE_TYPE }}" \
             --subnet-id "${{ secrets.AWS_SUBNET_ID }}" \
             --security-group-ids "${{ steps.sg.outputs.sg-id }}" \
-            --user-data file:///tmp/user-data.sh \
+            --user-data file:///tmp/user-data-k3s.sh \
             --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":20,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
             --tag-specifications \
               "ResourceType=instance,Tags=[{Key=Name,Value=k3s-to-talos-ci},{Key=GHRunId,Value=${{ github.run_id }}}]" \
@@ -180,31 +142,30 @@ jobs:
             --query 'Instances[0].InstanceId' --output text)
 
           echo "instance-id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
-          echo "Launched: $INSTANCE_ID"
+          echo "Launched instance: $INSTANCE_ID"
 
-      # ── Wait for the instance and SSH to be ready ────────────────────────────
       - name: Wait for instance running
         run: |
           aws ec2 wait instance-running \
             --instance-ids "${{ steps.ec2.outputs.instance-id }}"
 
-          PUBLIC_IP=$(aws ec2 describe-instances \
+          IP=$(aws ec2 describe-instances \
             --instance-ids "${{ steps.ec2.outputs.instance-id }}" \
             --query 'Reservations[0].Instances[0].PublicIpAddress' \
             --output text)
 
-          echo "INSTANCE_IP=$PUBLIC_IP" >> "$GITHUB_ENV"
-          echo "Instance IP: $PUBLIC_IP"
+          echo "NODE_IP=$IP" >> "$GITHUB_ENV"
+          echo "Instance IP: $IP"
 
-      - name: Wait for SSH to become available
+      - name: Wait for SSH
         run: |
-          echo "Waiting for SSH on $INSTANCE_IP..."
+          echo "Waiting for SSH on $NODE_IP..."
           for i in $(seq 1 40); do
             if ssh -i "$HOME/.ssh/ci_key" \
                    -o StrictHostKeyChecking=no \
                    -o UserKnownHostsFile=/dev/null \
                    -o ConnectTimeout=5 \
-                   "${{ matrix.ssh_user }}@$INSTANCE_IP" "exit 0" 2>/dev/null; then
+                   "ubuntu@$NODE_IP" "exit 0" 2>/dev/null; then
               echo "SSH ready after $((i*5))s"
               break
             fi
@@ -212,98 +173,1481 @@ jobs:
             sleep 5
           done
 
-      - name: Wait for cloud-init to complete
+      - name: Wait for k3s cluster to be ready
         run: |
-          # cloud-init runs user-data asynchronously; wait for it to finish
-          # installing k3s/kubeadm before running our tool.
-          ssh -i "$HOME/.ssh/ci_key" \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
-              "${{ matrix.ssh_user }}@$INSTANCE_IP" \
-              "sudo cloud-init status --wait --long" 2>&1 || true
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$NODE_IP"
+          echo "Waiting for k3s cluster to become ready (up to 15 minutes)..."
+          for i in $(seq 1 180); do
+            if $SSH "sudo k3s kubectl get nodes 2>/dev/null" | grep -q " Ready"; then
+              echo "k3s ready after $((i*5))s"
+              break
+            fi
+            [ "$i" -eq 180 ] && { echo "Timeout: k3s not ready after 15 minutes"; exit 1; }
+            sleep 5
+          done
 
-          # Verify root SSH works (user-data should have set it up).
-          ssh -i "$HOME/.ssh/ci_key" \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
-              "root@$INSTANCE_IP" "echo root-ssh-ok"
-
-      # ── Run k3s-to-talos collect ─────────────────────────────────────────────
-      - name: Run collect
+      # ── Deploy test workload that should survive the migration ────────────
+      - name: Deploy test workload on k3s
         run: |
-          ./k3s-to-talos collect \
-            --host "$INSTANCE_IP" \
-            --ssh-user root \
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$NODE_IP"
+          $SSH "sudo k3s kubectl create deployment ci-test-nginx --image=nginx:alpine --replicas=1"
+          $SSH "sudo k3s kubectl get deployment ci-test-nginx"
+
+      # ── Run the full migration (collect → nextboot → bootstrap) ───────────
+      # --yes skips the interactive confirmation prompt
+      # The migrate command:
+      #   1. Backs up k3s etcd snapshot + resources
+      #   2. Generates Talos machine config
+      #   3. Runs nextboot-talos.py — rewrites disk with Talos image, reboots
+      #   4. Waits for Talos, applies config, restores etcd from snapshot,
+      #      retrieves kubeconfig
+      - name: Run k3s-to-talos migrate
+        run: |
+          mkdir -p test-backup
+          # Tee all output to a log file so the backup artifact captures it.
+          # pipefail ensures the exit code comes from migrate, not tee.
+          set -o pipefail
+          ./k3s-to-talos migrate \
+            --host "$NODE_IP" \
+            --ssh-user ubuntu \
             --ssh-key "$HOME/.ssh/ci_key" \
-            --backup-dir ./test-backup
+            --sudo \
+            --talos-version "${{ env.TALOS_VERSION }}" \
+            --cluster-name "ci-migration-test" \
+            --yes \
+            --backup-dir ./test-backup \
+          2>&1 | tee test-backup/migrate.log
 
-      # ── Assert backup contents ───────────────────────────────────────────────
-      - name: Assert backup artefacts
+      # ── Remove control-plane taint so pods can schedule on the single node ──
+      # Talos sets node-role.kubernetes.io/control-plane:NoSchedule by default.
+      # In a single-node cluster the control plane must also run workloads.
+      - name: Remove control-plane taint
         run: |
-          echo "=== Backup contents ==="
-          find test-backup -type f | sort
+          export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
+          # Wait for node to show Ready (not just API available) — this is the
+          # signal that kubelet and CNI (Flannel) are initialised and pods can
+          # be scheduled and networked.  Can take 10+ min after etcd restore.
+          echo "Waiting for Talos node to be Ready (up to 15 minutes)..."
+          for i in $(seq 1 180); do
+            if kubectl get nodes --no-headers 2>/dev/null | grep -q " Ready"; then
+              echo "Node Ready after $((i*5))s"
+              kubectl get nodes
+              break
+            fi
+            [ "$i" -eq 180 ] && { echo "Node not Ready after 15 min"; \
+              kubectl get nodes || true; exit 1; }
+            sleep 5
+          done
+          kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          # After etcd restore Talos's kubelet may re-register within ~2 minutes
+          # and re-apply the control-plane taint.  Keep removing it for 90 s to
+          # ensure it stays gone before the pod scheduling check runs.
+          echo "Re-removing control-plane taint for 90 s to cover kubelet re-registration..."
+          for i in $(seq 1 18); do
+            sleep 5
+            kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          done
+          echo "✓ Control-plane taint removed"
 
-          echo "=== Assertions ==="
-          test -f test-backup/k3s.yaml            && echo "✓ kubeconfig"
-          test -f test-backup/database/backup-info.json && echo "✓ db backup metadata"
+      # ── Verify workload survived the migration and is running ─────────────
+      - name: Verify ci-test-nginx deployment on Talos
+        run: |
+          export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
+          echo "Waiting for ci-test-nginx pods to be Running after etcd restore..."
+          for i in $(seq 1 180); do
+            RUNNING=$(kubectl get pods -l app=ci-test-nginx \
+              --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+            if [ "$RUNNING" -ge 1 ]; then
+              echo "✓ ci-test-nginx is Running on Talos after migration"
+              kubectl get pods -l app=ci-test-nginx
+              break
+            fi
+            [ "$i" -eq 180 ] && { echo "✗ ci-test-nginx pods not Running after 15 min"; \
+              kubectl get pods; kubectl describe pods -l app=ci-test-nginx; exit 1; }
+            sleep 5
+          done
 
-          grep -q "cluster_type" test-backup/migration-state.json 2>/dev/null || true
+      # ── Capture EC2 serial console for post-mortem debugging ─────────────
+      # The serial console shows GRUB, kernel boot, and Talos startup logs,
+      # which is essential for diagnosing boot failures.  Note: console output
+      # is buffered by the hypervisor and may lag 1-2 minutes behind reality.
+      - name: Capture EC2 serial console output
+        if: always()
+        run: |
+          echo "=== EC2 Serial Console Output ==="
+          aws ec2 get-console-output \
+            --instance-id "${{ steps.ec2.outputs.instance-id }}" \
+            --latest \
+            --output text 2>/dev/null || echo "(no console output available yet)"
+          echo "=== End Serial Console ==="
 
-          resource_count=$(find test-backup/resources -name "*.yaml" 2>/dev/null | wc -l)
-          echo "  Exported resource files: $resource_count"
-          test "$resource_count" -gt 0 && echo "✓ resources exported"
+      # ── Post-failure diagnostics: what state is the machine in? ───────────
+      # Runs even on success so we always have diagnostic data.
+      # Key questions:
+      #   - Is port 22 (SSH/Ubuntu) or 50000 (Talos API) open?
+      #   - Is Talos in maintenance mode (insecure endpoint responds)?
+      #   - Is Talos in configured mode (CA-verified endpoint responds)?
+      - name: Diagnose machine state
+        if: always()
+        # Every talosctl command here may legitimately fail (wrong mode, port
+        # closed, etc).  Use "|| true" so that set -e does not abort the step
+        # prematurely — we want ALL diagnostic sections to run.
+        run: |
+          echo "=== Port connectivity ==="
+          nc -w 3 -zv "$NODE_IP" 22    2>&1 && echo "port 22:    OPEN  (Ubuntu SSH)"  || echo "port 22:    CLOSED"
+          nc -w 3 -zv "$NODE_IP" 50000 2>&1 && echo "port 50000: OPEN  (Talos API)"   || echo "port 50000: CLOSED"
+          nc -w 3 -zv "$NODE_IP" 6443  2>&1 && echo "port 6443:  OPEN  (kube API)"    || echo "port 6443:  CLOSED"
 
-          db_type=$(jq -r .type test-backup/database/backup-info.json 2>/dev/null)
-          echo "  Database type: $db_type"
+          echo ""
+          echo "=== talosctl version --insecure (maintenance-mode probe) ==="
+          talosctl version --insecure \
+            --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 15s 2>&1 || true
+          echo "exit code: $?"
 
-          case "${{ matrix.cluster }}" in
-            k3s)
-              test -f test-backup/database/state.db \
-                || test -f test-backup/database/etcd-snapshot.db \
-                && echo "✓ k3s database backup present"
-              ;;
-            kubeadm)
-              test -f test-backup/database/etcd-snapshot.db && echo "✓ etcd snapshot present"
-              ;;
-          esac
+          echo ""
+          echo "=== talosctl version CA-verified (configured-mode probe) ==="
+          TALOSCFG="./test-backup/talos-config/talosconfig"
+          if [ -f "$TALOSCFG" ]; then
+            talosctl --talosconfig "$TALOSCFG" version \
+              --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 15s 2>&1 || true
+            echo "exit code: $?"
+          else
+            echo "talosconfig not found at $TALOSCFG"
+          fi
 
-          echo "All assertions passed."
+          echo ""
+          echo "=== talosctl dmesg --insecure (kernel ring buffer via maintenance API) ==="
+          talosctl dmesg --insecure \
+            --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 15s 2>&1 \
+            | tail -50 || echo "(dmesg --insecure not available)"
 
-      # ── Upload backup as workflow artefact ───────────────────────────────────
+          echo ""
+          echo "=== talosctl dmesg CA-verified ==="
+          TALOSCFG="./test-backup/talos-config/talosconfig"
+          if [ -f "$TALOSCFG" ]; then
+            talosctl --talosconfig "$TALOSCFG" dmesg \
+              --nodes "$NODE_IP" --tail 50 --timeout 15s 2>&1 || echo "(dmesg not available)"
+          fi
+
+          echo ""
+          echo "=== talosctl logs machined --insecure ==="
+          talosctl logs machined --insecure \
+            --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 15s 2>&1 \
+            | tail -50 || echo "(machined logs not available)"
+
+          echo ""
+          echo "=== EC2 serial console (boot log) ==="
+          aws ec2 get-console-output \
+            --instance-id "${{ steps.ec2.outputs.instance-id }}" \
+            --latest --output text 2>/dev/null \
+            | tail -100 || echo "(no console output)"
+
+      # ── Upload backup artefacts for debugging ─────────────────────────────
       - name: Upload backup artefact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: backup-${{ matrix.cluster }}-${{ matrix.distro }}
+          name: backup-k3s-ubuntu-24.04
           path: test-backup/
           retention-days: 3
 
-      # ── Always terminate and clean up ────────────────────────────────────────
-      - name: Terminate EC2 instance
+      # ── Cleanup ───────────────────────────────────────────────────────────
+      - name: Terminate instance
         if: always()
         run: |
-          if [ -n "${{ steps.ec2.outputs.instance-id }}" ]; then
-            aws ec2 terminate-instances \
-              --instance-ids "${{ steps.ec2.outputs.instance-id }}"
-            echo "Termination requested for ${{ steps.ec2.outputs.instance-id }}"
-          fi
+          aws ec2 terminate-instances \
+            --instance-ids "${{ steps.ec2.outputs.instance-id }}" 2>/dev/null || true
 
       - name: Delete security group
         if: always()
         run: |
           SG="${{ steps.sg.outputs.sg-id }}"
-          if [ -z "$SG" ]; then exit 0; fi
-
-          # Security group can't be deleted while the instance is still shutting down.
-          # Wait up to 90 s for the instance to be terminated.
-          for i in $(seq 1 18); do
-            STATE=$(aws ec2 describe-instances \
-              --instance-ids "${{ steps.ec2.outputs.instance-id }}" \
-              --query 'Reservations[0].Instances[0].State.Name' \
-              --output text 2>/dev/null || echo terminated)
-            [ "$STATE" = "terminated" ] && break
+          [ -z "$SG" ] && exit 0
+          for i in $(seq 1 12); do
+            aws ec2 delete-security-group --group-id "$SG" 2>/dev/null && break
             sleep 5
           done
 
-          aws ec2 delete-security-group --group-id "$SG" 2>/dev/null || \
-            echo "SG $SG will be cleaned up by the cost-management policy."
+  # ── Multi-node end-to-end test: 1 CP + 1 worker ──────────────────────────────
+  # Flow:
+  #   1. Launch two Ubuntu instances (control plane + worker)
+  #   2. Install k3s server on CP; join worker as k3s agent
+  #   3. Deploy nginx test workload (1 replica on worker)
+  #   4. Run 'migrate' on CP  → CP becomes Talos, etcd restored
+  #   5. Remove CP taint; run 'join-worker' on worker → worker becomes Talos
+  #   6. Verify both nodes are Talos and nginx pods are Running
+  ec2-test-multinode:
+    name: k3s → Talos migration (multi-node)
+    needs: [build, resolve-amis]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: k3s-to-talos-binary
+      - run: chmod +x k3s-to-talos
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install talosctl
+        run: |
+          curl -fsSL \
+            "https://github.com/siderolabs/talos/releases/download/${{ env.TALOS_VERSION }}/talosctl-linux-amd64" \
+            -o /usr/local/bin/talosctl
+          chmod +x /usr/local/bin/talosctl
+          talosctl version --client
+
+      - name: Generate SSH key pair
+        run: |
+          ssh-keygen -t ed25519 -f "$HOME/.ssh/ci_key" -N "" -q
+          echo "SSH_PUB_KEY=$(cat $HOME/.ssh/ci_key.pub)" >> "$GITHUB_ENV"
+
+      - name: Prepare user-data files
+        run: |
+          sed "s|__SSH_PUBLIC_KEY__|${SSH_PUB_KEY}|g" \
+            .github/scripts/user-data-k3s.sh > /tmp/user-data-cp.sh
+          sed "s|__SSH_PUBLIC_KEY__|${SSH_PUB_KEY}|g" \
+            .github/scripts/user-data-ssh-only.sh > /tmp/user-data-worker.sh
+
+      # Security group: external access + full intra-SG communication for
+      # k3s (kubelet, flannel VXLAN) and Talos (etcd gossip, etc.)
+      - name: Create security group
+        id: sg
+        run: |
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "k3s-to-talos-ci-mn-${{ github.run_id }}" \
+            --description "CI multi-node migration SG for run ${{ github.run_id }}" \
+            --vpc-id "${{ secrets.AWS_VPC_ID }}" \
+            --query 'GroupId' --output text)
+
+          # External access
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 50000 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 6443 --cidr 0.0.0.0/0
+          # Full intra-cluster communication (k3s CNI, Talos cluster traffic)
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol all --port -1 \
+            --source-group "$SG_ID"
+
+          echo "sg-id=$SG_ID" >> "$GITHUB_OUTPUT"
+          echo "Created SG: $SG_ID"
+
+      # Launch both instances in parallel; worker uses SSH-only user-data
+      # (k3s agent is installed later after we have the server token).
+      - name: Launch CP instance
+        id: ec2-cp
+        run: |
+          ID=$(aws ec2 run-instances \
+            --image-id "${{ needs.resolve-amis.outputs.ubuntu-2404 }}" \
+            --instance-type "${{ env.INSTANCE_TYPE }}" \
+            --subnet-id "${{ secrets.AWS_SUBNET_ID }}" \
+            --security-group-ids "${{ steps.sg.outputs.sg-id }}" \
+            --user-data file:///tmp/user-data-cp.sh \
+            --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":20,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+            --tag-specifications \
+              "ResourceType=instance,Tags=[{Key=Name,Value=k3s-to-talos-ci-cp},{Key=GHRunId,Value=${{ github.run_id }}}]" \
+            --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
+            --query 'Instances[0].InstanceId' --output text)
+          echo "instance-id=$ID" >> "$GITHUB_OUTPUT"
+          echo "Launched CP: $ID"
+
+      - name: Launch worker instance
+        id: ec2-worker
+        run: |
+          ID=$(aws ec2 run-instances \
+            --image-id "${{ needs.resolve-amis.outputs.ubuntu-2404 }}" \
+            --instance-type "${{ env.INSTANCE_TYPE }}" \
+            --subnet-id "${{ secrets.AWS_SUBNET_ID }}" \
+            --security-group-ids "${{ steps.sg.outputs.sg-id }}" \
+            --user-data file:///tmp/user-data-worker.sh \
+            --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":20,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+            --tag-specifications \
+              "ResourceType=instance,Tags=[{Key=Name,Value=k3s-to-talos-ci-worker},{Key=GHRunId,Value=${{ github.run_id }}}]" \
+            --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
+            --query 'Instances[0].InstanceId' --output text)
+          echo "instance-id=$ID" >> "$GITHUB_OUTPUT"
+          echo "Launched worker: $ID"
+
+      - name: Wait for instances running and collect IPs
+        run: |
+          aws ec2 wait instance-running \
+            --instance-ids \
+              "${{ steps.ec2-cp.outputs.instance-id }}" \
+              "${{ steps.ec2-worker.outputs.instance-id }}"
+
+          CP_IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2-cp.outputs.instance-id }}" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          WORKER_IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2-worker.outputs.instance-id }}" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          WORKER_PRIVATE_IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2-worker.outputs.instance-id }}" \
+            --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
+
+          echo "CP_IP=$CP_IP"           >> "$GITHUB_ENV"
+          echo "WORKER_IP=$WORKER_IP"   >> "$GITHUB_ENV"
+          echo "WORKER_PRIVATE_IP=$WORKER_PRIVATE_IP" >> "$GITHUB_ENV"
+          echo "CP public IP:     $CP_IP"
+          echo "Worker public IP: $WORKER_IP (private: $WORKER_PRIVATE_IP)"
+
+      - name: Wait for SSH on both nodes
+        run: |
+          SSH_OPTS="-i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5"
+          for NODE in "$CP_IP" "$WORKER_IP"; do
+            echo "Waiting for SSH on $NODE..."
+            for i in $(seq 1 40); do
+              ssh $SSH_OPTS "ubuntu@$NODE" "exit 0" 2>/dev/null && \
+                { echo "SSH ready on $NODE"; break; }
+              [ "$i" -eq 40 ] && { echo "SSH timeout on $NODE"; exit 1; }
+              sleep 5
+            done
+          done
+
+      - name: Wait for k3s ready on CP
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$CP_IP"
+          echo "Waiting for k3s CP to become ready (up to 15 minutes)..."
+          for i in $(seq 1 180); do
+            if $SSH "sudo k3s kubectl get nodes 2>/dev/null" | grep -q " Ready"; then
+              echo "k3s CP ready after $((i*5))s"
+              break
+            fi
+            [ "$i" -eq 180 ] && { echo "Timeout: k3s CP not ready"; exit 1; }
+            sleep 5
+          done
+
+      - name: Install k3s agent on worker
+        run: |
+          SSH_CP="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$CP_IP"
+          SSH_W="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$WORKER_IP"
+
+          # Get the server token (needed for agent join)
+          TOKEN=$($SSH_CP "sudo cat /var/lib/rancher/k3s/server/node-token")
+          echo "::add-mask::$TOKEN"
+
+          # Install k3s agent using the CP's private IP so that the join
+          # traffic stays on the internal network.
+          CP_PRIVATE_IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2-cp.outputs.instance-id }}" \
+            --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
+
+          $SSH_W "curl -sfL https://get.k3s.io | \
+            K3S_URL=https://${CP_PRIVATE_IP}:6443 \
+            K3S_TOKEN=${TOKEN} \
+            sh -"
+          echo "k3s agent installed on worker"
+
+      - name: Wait for both nodes Ready
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$CP_IP"
+          echo "Waiting for 2 nodes to be Ready (up to 5 minutes)..."
+          for i in $(seq 1 60); do
+            READY=$($SSH "sudo k3s kubectl get nodes --no-headers 2>/dev/null" \
+              | grep -c " Ready" || true)
+            if [ "$READY" -ge 2 ]; then
+              echo "Both nodes Ready after $((i*5))s"
+              $SSH "sudo k3s kubectl get nodes"
+              break
+            fi
+            [ "$i" -eq 60 ] && { echo "Timeout: only $READY/2 nodes Ready"; \
+              $SSH "sudo k3s kubectl get nodes" || true; exit 1; }
+            sleep 5
+          done
+
+      # Deploy nginx on the worker node so we can verify it survives migration
+      - name: Deploy test workload on k3s worker
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$CP_IP"
+          WORKER_NODE=$($SSH "sudo k3s kubectl get nodes --no-headers" \
+            | grep -v "control-plane" | awk '{print $1}')
+          echo "Scheduling nginx on worker node: $WORKER_NODE"
+          $SSH "sudo k3s kubectl create deployment ci-test-nginx \
+            --image=nginx:alpine --replicas=1 \
+            -- /bin/sh -c 'nginx -g \"daemon off;\"' || true"
+          $SSH "sudo k3s kubectl patch deployment ci-test-nginx \
+            -p '{\"spec\":{\"template\":{\"spec\":{\"nodeName\":\"'\"$WORKER_NODE\"'\"}}}}'  " || true
+          $SSH "sudo k3s kubectl get deployment ci-test-nginx"
+
+      # ── Migrate control plane ─────────────────────────────────────────────
+      - name: Run k3s-to-talos migrate (control plane)
+        run: |
+          mkdir -p test-backup
+          set -o pipefail
+          ./k3s-to-talos migrate \
+            --host "$CP_IP" \
+            --ssh-user ubuntu \
+            --ssh-key "$HOME/.ssh/ci_key" \
+            --sudo \
+            --talos-version "${{ env.TALOS_VERSION }}" \
+            --cluster-name "ci-multinode-test" \
+            --yes \
+            --backup-dir ./test-backup \
+          2>&1 | tee test-backup/migrate-cp.log
+
+      # Remove taint so pods can schedule on the CP while the worker migrates
+      - name: Remove control-plane taint
+        run: |
+          export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
+          echo "Waiting for CP node to be Ready (up to 15 minutes)..."
+          for i in $(seq 1 180); do
+            if kubectl get nodes --no-headers 2>/dev/null | grep -q " Ready"; then
+              echo "Node Ready after $((i*5))s"; kubectl get nodes; break
+            fi
+            [ "$i" -eq 180 ] && { echo "Node not Ready after 15 min"; \
+              kubectl get nodes || true; exit 1; }
+            sleep 5
+          done
+          kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          echo "Re-removing control-plane taint for 90 s to cover kubelet re-registration..."
+          for i in $(seq 1 18); do
+            sleep 5
+            kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          done
+          echo "✓ Control-plane taint removed"
+
+      # After migrating from k3s (etcd restore), the Talos bootstrap token
+      # (cluster.token from gen config) does not exist in the Kubernetes API —
+      # the restored k3s etcd data contains k3s's own state, not the Talos
+      # bootstrap token Secret.  Talos worker nodes use this token to bootstrap
+      # their kubelet kubeconfig (standard Kubernetes bootstrap-token flow).
+      # Without it the kubelet cannot submit a CSR, and the worker never joins.
+      #
+      # We create the token Secret here (after the CP is Ready and before the
+      # worker migration) so the worker's kubelet can authenticate on first boot.
+      - name: Create Kubernetes bootstrap token for worker join
+        run: |
+          export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
+
+          # Extract cluster token from worker.yaml (one-liner avoids YAML indent issues).
+          TOKEN=$(python3 -c "import yaml,sys; cfg=yaml.safe_load(open('test-backup/talos-config/worker.yaml')); tok=cfg.get('cluster',{}).get('token',''); tok or sys.exit(1); print(tok)" \
+            2>/dev/null) || { echo "Warning: could not parse cluster token — worker join may fail"; exit 0; }
+
+          TOKEN_ID="${TOKEN%%.*}"
+          TOKEN_SECRET="${TOKEN##*.}"
+          echo "Cluster token ID: ${TOKEN_ID} (secret length: ${#TOKEN_SECRET})"
+
+          # Create bootstrap token Secret (stringData → kube base64-encodes it).
+          # Use printf to avoid YAML-in-YAML heredoc indentation issues.
+          printf '%s\n' \
+            'apiVersion: v1' \
+            'kind: Secret' \
+            'metadata:' \
+            "  name: bootstrap-token-${TOKEN_ID}" \
+            '  namespace: kube-system' \
+            'type: bootstrap.kubernetes.io/token' \
+            'stringData:' \
+            "  token-id: ${TOKEN_ID}" \
+            "  token-secret: ${TOKEN_SECRET}" \
+            '  usage-bootstrap-authentication: "true"' \
+            '  usage-bootstrap-signing: "true"' \
+            '  auth-extra-groups: "system:bootstrappers:kubernetes"' \
+            | kubectl apply -f -
+
+          # Ensure the bootstrappers group can submit CSRs.
+          # system:node-bootstrapper is a built-in ClusterRole; the binding may
+          # not exist after etcd restore from k3s (k3s uses its own join mechanism).
+          kubectl create clusterrolebinding talos-bootstrapper-node-token \
+              --clusterrole=system:node-bootstrapper \
+              --group=system:bootstrappers:kubernetes \
+              2>/dev/null || echo "(ClusterRoleBinding already exists)"
+
+          # Allow auto-approval of kubelet client CSRs for bootstrap nodes.
+          kubectl create clusterrolebinding talos-bootstrapper-csr-nodeclient \
+              --clusterrole=system:certificates.k8s.io:certificatesigningrequests:nodeclient \
+              --group=system:bootstrappers:kubernetes \
+              2>/dev/null || echo "(CSR approval binding already exists)"
+
+          # Allow nodes to renew their own server certs.
+          kubectl create clusterrolebinding talos-bootstrapper-csr-selfnodeclient \
+              --clusterrole=system:certificates.k8s.io:certificatesigningrequests:selfnodeclient \
+              --group=system:nodes \
+              2>/dev/null || echo "(self-renewal binding already exists)"
+
+          echo "✓ Bootstrap token and RBAC applied (token-id: ${TOKEN_ID})"
+
+      # ── Pre-flight diagnostics: worker state before nextboot ─────────────
+      - name: Worker pre-flight diagnostics
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$WORKER_IP"
+          echo "=== Worker disk layout ==="
+          $SSH "lsblk -o NAME,SIZE,TYPE,MOUNTPOINT" || true
+          echo "=== Worker boot device ==="
+          $SSH "findmnt /" || true
+          echo "=== Worker UEFI NVRAM (before nextboot) ==="
+          $SSH "sudo efibootmgr -v 2>&1 || echo 'efibootmgr not available/installed'" || true
+          echo "=== Worker efivarfs mount ==="
+          $SSH "mount | grep efi || echo 'no efi mounts found'" || true
+          echo "=== Worker DMI sys_vendor ==="
+          $SSH "cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo 'not found'" || true
+          echo "=== Worker k3s-agent status ==="
+          $SSH "systemctl is-active k3s-agent 2>/dev/null || echo 'inactive/not-found'" || true
+          echo "=== Worker free memory ==="
+          $SSH "free -h" || true
+
+      # Stop k3s-agent before nextboot to free memory and avoid interference.
+      # The agent is likely crash-looping since the CP is now Talos (not k3s).
+      #
+      # We use k3s-killall.sh when available because systemctl stop alone leaves
+      # behind the flannel.1 VXLAN interface, cni0, and iptables rules.  The
+      # leftover flannel.1 VTEP can cause MTU-related TCP failures: HTTPS
+      # connections to factory.talos.dev succeed at the TCP/TLS layer but
+      # large response bodies are silently dropped (VXLAN encap reduces the
+      # effective MTU, ICMP "fragmentation needed" is blocked, and TCP MSS is
+      # not re-negotiated).  This manifests as the nextboot agent hanging or
+      # timing out while streaming the Talos disk image.
+      - name: Stop k3s-agent on worker
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$WORKER_IP"
+          # Prefer k3s-killall.sh: removes flannel.1, cni0, and iptables rules.
+          if $SSH "test -f /usr/local/bin/k3s-killall.sh" 2>/dev/null; then
+            echo "Running k3s-killall.sh to fully tear down k3s networking..."
+            $SSH "sudo /usr/local/bin/k3s-killall.sh 2>/dev/null || true"
+          else
+            $SSH "sudo systemctl stop k3s-agent 2>/dev/null || true"
+            $SSH "sudo systemctl stop k3s 2>/dev/null || true"
+            # Manually clean up k3s network interfaces to avoid MTU/iptables issues.
+            $SSH "sudo ip link delete flannel.1 2>/dev/null || true"
+            $SSH "sudo ip link delete cni0 2>/dev/null || true"
+            $SSH "sudo ip link delete flannel-wg 2>/dev/null || true"
+          fi
+          echo "✓ k3s-agent stopped and k3s networking torn down"
+
+      # Kill unattended-upgrades to release the apt lock before nextboot.
+      # The worker machine has been running for ~45 min by this point, long
+      # enough for apt-daily-upgrade.service to start and hold the dpkg lock.
+      # The nextboot agent calls apt-get to install efibootmgr/sgdisk; if apt
+      # is locked, apt-get hangs indefinitely, the SSH TCP connection idles,
+      # an intermediate NAT clears the state, and installer.Run() falsely
+      # treats the disconnect as a successful machine reboot.
+      #
+      # NOTE: We do NOT kill dpkg with SIGKILL because that can corrupt the
+      # dpkg database (partially-written status file) and cause subsequent
+      # apt-get calls to fail with "dpkg was interrupted".
+      - name: Kill unattended-upgrades on worker
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$WORKER_IP"
+          echo "Stopping unattended-upgrades and apt services..."
+          $SSH "sudo systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true"
+          $SSH "sudo systemctl mask apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true"
+          $SSH "sudo killall -9 unattended-upgrade unattended-upgrades apt-get 2>/dev/null || true"
+          echo "Waiting for apt/dpkg lock to be released..."
+          for i in $(seq 1 30); do
+            if ! $SSH "sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null" 2>/dev/null; then
+              echo "apt lock is free after ${i}s"
+              break
+            fi
+            sleep 2
+          done
+          echo "=== apt lock status ==="
+          $SSH "sudo fuser /var/lib/dpkg/lock-frontend 2>/dev/null && echo 'LOCK STILL HELD' || echo 'Lock free'" || echo "Lock free"
+          echo "Repairing any interrupted dpkg state..."
+          $SSH "sudo dpkg --configure -a 2>/dev/null || true"
+          echo "Pre-installing tools needed by the nextboot agent..."
+          $SSH "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q zstd efibootmgr gdisk 2>/dev/null || true"
+          echo "✓ unattended-upgrades killed and tools pre-installed"
+
+      # ── Verify worker internet connectivity before nextboot ─────────────
+      - name: Verify worker internet connectivity
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$WORKER_IP"
+          echo "=== Checking worker internet connectivity ==="
+          $SSH "curl -sI --max-time 15 https://factory.talos.dev 2>&1 | head -5 || echo 'factory.talos.dev unreachable — agent will retry 3x'" || true
+          echo "=== DNS resolution ==="
+          $SSH "nslookup factory.talos.dev 2>&1 || dig factory.talos.dev +short 2>&1 || echo 'DNS lookup failed'" || true
+          echo "=== Default route ==="
+          $SSH "ip route show default" || true
+          echo "=== /etc/resolv.conf ==="
+          $SSH "cat /etc/resolv.conf" || true
+
+      # ── Migrate worker node ───────────────────────────────────────────────
+      - name: Run join-worker (worker node)
+        run: |
+          set -o pipefail
+          ./k3s-to-talos join-worker \
+            --host "$WORKER_IP" \
+            --ssh-user ubuntu \
+            --ssh-key "$HOME/.ssh/ci_key" \
+            --sudo \
+            --talos-version "${{ env.TALOS_VERSION }}" \
+            --worker-config ./test-backup/talos-config/worker.yaml \
+            --talosconfig ./test-backup/talos-config/talosconfig \
+            --backup-dir ./test-backup \
+          2>&1 | tee test-backup/migrate-worker.log
+
+      # ── Show worker migration log inline (visible without downloading artifact)
+      - name: Show worker migration log
+        if: always()
+        run: |
+          echo "=== migrate-worker.log ==="
+          cat test-backup/migrate-worker.log 2>/dev/null || echo "(log not found — join-worker may not have started)"
+          echo ""
+          echo "=== Worker port status after join-worker ==="
+          nc -w 3 -zv "$WORKER_IP" 22    2>&1 && echo "port 22:    OPEN"    || echo "port 22:    CLOSED"
+          nc -w 3 -zv "$WORKER_IP" 50000 2>&1 && echo "port 50000: OPEN" || echo "port 50000: CLOSED"
+          echo ""
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 ubuntu@$WORKER_IP"
+          if nc -w 3 -zv "$WORKER_IP" 22 2>/dev/null; then
+            echo "Worker is STILL in Ubuntu after join-worker — capturing post-reboot UEFI state:"
+            echo "=== Worker UEFI NVRAM (after reboot) ==="
+            $SSH "sudo efibootmgr -v 2>&1 || echo 'efibootmgr not installed'" || true
+            echo "=== Worker lsblk (after reboot) ==="
+            $SSH "lsblk -o NAME,SIZE,TYPE,MOUNTPOINT" || true
+            echo "=== Worker OS ==="
+            $SSH "cat /etc/os-release | grep PRETTY_NAME" || true
+          else
+            echo "Worker SSH (port 22) is closed — worker has rebooted out of Ubuntu (expected for success)"
+          fi
+          echo ""
+          echo "=== Worker EC2 serial console (boot log after reboot) ==="
+          aws ec2 get-console-output \
+            --instance-id "${{ steps.ec2-worker.outputs.instance-id }}" \
+            --latest --output text 2>/dev/null \
+            | tail -80 || echo "(no console output available)"
+
+      # ── Verify both nodes are Talos and workload is running ───────────────
+      - name: Verify both nodes are Talos
+        run: |
+          export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
+          echo "Waiting for 2 Talos nodes to be Ready (up to 15 minutes)..."
+          for i in $(seq 1 180); do
+            READY=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready" || true)
+            if [ "$READY" -ge 2 ]; then
+              echo "✓ Both nodes Ready after $((i*5))s"
+              kubectl get nodes
+              break
+            fi
+            # Periodic status every 60s so we can see join progress in logs.
+            [ $((i % 12)) -eq 0 ] && {
+              echo "--- node status at $((i*5))s ---"
+              kubectl get nodes --no-headers 2>/dev/null || true
+              echo "--- pending CSRs ---"
+              kubectl get csr --no-headers 2>/dev/null | head -10 || true
+            }
+            [ "$i" -eq 180 ] && {
+              echo "✗ Only $READY/2 nodes Ready after 15 min"
+              kubectl get nodes -o wide || true
+              echo "=== CSRs ==="
+              kubectl get csr 2>/dev/null || true
+              echo "=== kube-system bootstrap token ==="
+              kubectl get secret -n kube-system -l "type=bootstrap.kubernetes.io/token" 2>/dev/null || true
+              exit 1
+            }
+            sleep 5
+          done
+
+      - name: Verify ci-test-nginx is Running on Talos cluster
+        run: |
+          export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
+          echo "Waiting for ci-test-nginx pods to be Running (up to 15 minutes)..."
+          for i in $(seq 1 180); do
+            RUNNING=$(kubectl get pods -l app=ci-test-nginx \
+              --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+            if [ "$RUNNING" -ge 1 ]; then
+              echo "✓ ci-test-nginx is Running on Talos cluster after multi-node migration"
+              kubectl get pods -l app=ci-test-nginx
+              break
+            fi
+            [ "$i" -eq 180 ] && { echo "✗ ci-test-nginx not Running after 15 min"; \
+              kubectl get pods; kubectl describe pods -l app=ci-test-nginx; exit 1; }
+            sleep 5
+          done
+
+      # ── Diagnostics ───────────────────────────────────────────────────────
+      - name: Diagnose machine state (CP)
+        if: always()
+        run: |
+          TALOSCFG="./test-backup/talos-config/talosconfig"
+          echo "=== CP port connectivity ==="
+          nc -w 3 -zv "$CP_IP" 50000 2>&1 && echo "50000: OPEN" || echo "50000: CLOSED"
+          nc -w 3 -zv "$CP_IP" 6443  2>&1 && echo "6443: OPEN"  || echo "6443: CLOSED"
+          echo "=== CP talosctl version ==="
+          [ -f "$TALOSCFG" ] && talosctl --talosconfig "$TALOSCFG" version \
+            --nodes "$CP_IP" --endpoints "$CP_IP" 2>&1 || true
+          echo "=== Worker port connectivity ==="
+          nc -w 3 -zv "$WORKER_IP" 50000 2>&1 && echo "50000: OPEN" || echo "50000: CLOSED"
+          echo "=== Worker talosctl version ==="
+          [ -f "$TALOSCFG" ] && talosctl --talosconfig "$TALOSCFG" version \
+            --nodes "$WORKER_IP" --endpoints "$WORKER_IP" 2>&1 || true
+
+      - name: Upload backup artefact (multi-node)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-multinode-k3s-ubuntu-24.04
+          path: test-backup/
+          retention-days: 3
+
+      - name: Terminate instances
+        if: always()
+        run: |
+          aws ec2 terminate-instances \
+            --instance-ids \
+              "${{ steps.ec2-cp.outputs.instance-id }}" \
+              "${{ steps.ec2-worker.outputs.instance-id }}" \
+            2>/dev/null || true
+
+      - name: Delete security group
+        if: always()
+        run: |
+          SG="${{ steps.sg.outputs.sg-id }}"
+          [ -z "$SG" ] && exit 0
+          for i in $(seq 1 12); do
+            aws ec2 delete-security-group --group-id "$SG" 2>/dev/null && break
+            sleep 5
+          done
+
+  # ── End-to-end kubeadm → Talos migration test (single node) ─────────────────
+  # Flow: Ubuntu kubeadm instance → nextboot-talos.py converts OS in-place →
+  #       same instance reboots into Talos → etcd restore from kubeadm snapshot →
+  #       verify workload survived migration
+  ec2-test-kubeadm:
+    name: kubeadm → Talos migration (single node)
+    needs: [build, resolve-amis]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: k3s-to-talos-binary
+      - run: chmod +x k3s-to-talos
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install talosctl
+        run: |
+          curl -fsSL \
+            "https://github.com/siderolabs/talos/releases/download/${{ env.TALOS_VERSION }}/talosctl-linux-amd64" \
+            -o /usr/local/bin/talosctl
+          chmod +x /usr/local/bin/talosctl
+          talosctl version --client
+
+      - name: Generate SSH key pair
+        run: |
+          ssh-keygen -t ed25519 -f "$HOME/.ssh/ci_key" -N "" -q
+          echo "SSH_PUB_KEY=$(cat $HOME/.ssh/ci_key.pub)" >> "$GITHUB_ENV"
+
+      - name: Prepare kubeadm user-data
+        run: |
+          sed "s|__SSH_PUBLIC_KEY__|${SSH_PUB_KEY}|g" \
+            .github/scripts/user-data-kubeadm.sh > /tmp/user-data-kubeadm.sh
+
+      - name: Create security group
+        id: sg
+        run: |
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "k3s-to-talos-ci-km-${{ github.run_id }}" \
+            --description "CI kubeadm migration SG for run ${{ github.run_id }}" \
+            --vpc-id "${{ secrets.AWS_VPC_ID }}" \
+            --query 'GroupId' --output text)
+
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 50000 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 6443 --cidr 0.0.0.0/0
+
+          echo "sg-id=$SG_ID" >> "$GITHUB_OUTPUT"
+          echo "Created SG: $SG_ID"
+
+      - name: Launch kubeadm instance
+        id: ec2
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "${{ needs.resolve-amis.outputs.ubuntu-2404 }}" \
+            --instance-type "${{ env.INSTANCE_TYPE }}" \
+            --subnet-id "${{ secrets.AWS_SUBNET_ID }}" \
+            --security-group-ids "${{ steps.sg.outputs.sg-id }}" \
+            --user-data file:///tmp/user-data-kubeadm.sh \
+            --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":20,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+            --tag-specifications \
+              "ResourceType=instance,Tags=[{Key=Name,Value=k3s-to-talos-ci-kubeadm},{Key=GHRunId,Value=${{ github.run_id }}}]" \
+            --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
+            --query 'Instances[0].InstanceId' --output text)
+
+          echo "instance-id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "Launched instance: $INSTANCE_ID"
+
+      - name: Wait for instance running
+        run: |
+          aws ec2 wait instance-running \
+            --instance-ids "${{ steps.ec2.outputs.instance-id }}"
+
+          IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2.outputs.instance-id }}" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+
+          echo "NODE_IP=$IP" >> "$GITHUB_ENV"
+          echo "Instance IP: $IP"
+
+      - name: Wait for SSH
+        run: |
+          echo "Waiting for SSH on $NODE_IP..."
+          for i in $(seq 1 40); do
+            if ssh -i "$HOME/.ssh/ci_key" \
+                   -o StrictHostKeyChecking=no \
+                   -o UserKnownHostsFile=/dev/null \
+                   -o ConnectTimeout=5 \
+                   "ubuntu@$NODE_IP" "exit 0" 2>/dev/null; then
+              echo "SSH ready after $((i*5))s"
+              break
+            fi
+            [ "$i" -eq 40 ] && { echo "SSH timeout"; exit 1; }
+            sleep 5
+          done
+
+      - name: Wait for kubeadm cluster to be ready
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$NODE_IP"
+          echo "Waiting for kubeadm cluster to become ready (up to 15 minutes)..."
+          for i in $(seq 1 180); do
+            if $SSH "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes 2>/dev/null" \
+                | grep -q " Ready"; then
+              echo "kubeadm ready after $((i*5))s"
+              $SSH "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes"
+              break
+            fi
+            [ "$i" -eq 180 ] && { echo "Timeout: kubeadm not ready after 15 minutes"; exit 1; }
+            sleep 5
+          done
+
+      - name: Deploy test workload on kubeadm
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$NODE_IP"
+          $SSH "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf \
+            create deployment ci-test-nginx --image=nginx:alpine --replicas=1"
+          $SSH "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf \
+            get deployment ci-test-nginx"
+
+      - name: Run k3s-to-talos migrate (kubeadm)
+        run: |
+          mkdir -p test-backup
+          set -o pipefail
+          ./k3s-to-talos migrate \
+            --host "$NODE_IP" \
+            --ssh-user ubuntu \
+            --ssh-key "$HOME/.ssh/ci_key" \
+            --sudo \
+            --talos-version "${{ env.TALOS_VERSION }}" \
+            --cluster-name "ci-kubeadm-test" \
+            --yes \
+            --backup-dir ./test-backup \
+          2>&1 | tee test-backup/migrate.log
+
+      - name: Remove control-plane taint
+        run: |
+          export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
+          echo "Waiting for Talos node to be Ready (up to 15 minutes)..."
+          for i in $(seq 1 180); do
+            if kubectl get nodes --no-headers 2>/dev/null | grep -q " Ready"; then
+              echo "Node Ready after $((i*5))s"
+              kubectl get nodes
+              break
+            fi
+            [ "$i" -eq 180 ] && { echo "Node not Ready after 15 min"; \
+              kubectl get nodes || true; exit 1; }
+            sleep 5
+          done
+          kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          echo "Re-removing control-plane taint for 90 s to cover kubelet re-registration..."
+          for i in $(seq 1 18); do
+            sleep 5
+            kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          done
+          echo "✓ Control-plane taint removed"
+
+      - name: Verify ci-test-nginx deployment on Talos
+        run: |
+          export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
+          echo "Waiting for ci-test-nginx pods to be Running after etcd restore..."
+          for i in $(seq 1 180); do
+            RUNNING=$(kubectl get pods -l app=ci-test-nginx \
+              --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+            if [ "$RUNNING" -ge 1 ]; then
+              echo "✓ ci-test-nginx is Running on Talos after kubeadm migration"
+              kubectl get pods -l app=ci-test-nginx
+              break
+            fi
+            [ "$i" -eq 180 ] && { echo "✗ ci-test-nginx pods not Running after 15 min"; \
+              kubectl get pods; kubectl describe pods -l app=ci-test-nginx; exit 1; }
+            sleep 5
+          done
+
+      - name: Capture EC2 serial console output
+        if: always()
+        run: |
+          echo "=== EC2 Serial Console Output ==="
+          aws ec2 get-console-output \
+            --instance-id "${{ steps.ec2.outputs.instance-id }}" \
+            --latest \
+            --output text 2>/dev/null || echo "(no console output available yet)"
+          echo "=== End Serial Console ==="
+
+      - name: Diagnose machine state
+        if: always()
+        run: |
+          echo "=== Port connectivity ==="
+          nc -w 3 -zv "$NODE_IP" 22    2>&1 && echo "port 22:    OPEN  (SSH)"      || echo "port 22:    CLOSED"
+          nc -w 3 -zv "$NODE_IP" 50000 2>&1 && echo "port 50000: OPEN  (Talos API)" || echo "port 50000: CLOSED"
+          nc -w 3 -zv "$NODE_IP" 6443  2>&1 && echo "port 6443:  OPEN  (kube API)" || echo "port 6443:  CLOSED"
+
+          echo ""
+          echo "=== talosctl version --insecure ==="
+          talosctl version --insecure \
+            --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 15s 2>&1 || true
+
+          TALOSCFG="./test-backup/talos-config/talosconfig"
+          if [ -f "$TALOSCFG" ]; then
+            echo ""
+            echo "=== talosctl version CA-verified ==="
+            talosctl --talosconfig "$TALOSCFG" version \
+              --nodes "$NODE_IP" --endpoints "$NODE_IP" --timeout 15s 2>&1 || true
+          fi
+
+          echo ""
+          echo "=== EC2 serial console ==="
+          aws ec2 get-console-output \
+            --instance-id "${{ steps.ec2.outputs.instance-id }}" \
+            --latest --output text 2>/dev/null \
+            | tail -100 || echo "(no console output)"
+
+      - name: Upload backup artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-kubeadm-ubuntu-24.04
+          path: test-backup/
+          retention-days: 3
+
+      - name: Terminate instance
+        if: always()
+        run: |
+          aws ec2 terminate-instances \
+            --instance-ids "${{ steps.ec2.outputs.instance-id }}" 2>/dev/null || true
+
+      - name: Delete security group
+        if: always()
+        run: |
+          SG="${{ steps.sg.outputs.sg-id }}"
+          [ -z "$SG" ] && exit 0
+          for i in $(seq 1 12); do
+            aws ec2 delete-security-group --group-id "$SG" 2>/dev/null && break
+            sleep 5
+          done
+
+  # ── Multi-node kubeadm → Talos migration test ─────────────────────────────────
+  # Flow:
+  #   1. Launch two Ubuntu instances (control plane + worker)
+  #   2. Run kubeadm init on CP; join worker via kubeadm token create --print-join-command
+  #   3. Deploy nginx test workload
+  #   4. Run 'migrate' on CP  → CP becomes Talos, etcd restored
+  #   5. Create bootstrap token for worker join; run 'join-worker' on worker → Talos
+  #   6. Verify both nodes are Talos and nginx pods are Running
+  ec2-test-multinode-kubeadm:
+    name: kubeadm → Talos migration (multi-node)
+    needs: [build, resolve-amis]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: k3s-to-talos-binary
+      - run: chmod +x k3s-to-talos
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install talosctl
+        run: |
+          curl -fsSL \
+            "https://github.com/siderolabs/talos/releases/download/${{ env.TALOS_VERSION }}/talosctl-linux-amd64" \
+            -o /usr/local/bin/talosctl
+          chmod +x /usr/local/bin/talosctl
+          talosctl version --client
+
+      - name: Generate SSH key pair
+        run: |
+          ssh-keygen -t ed25519 -f "$HOME/.ssh/ci_key" -N "" -q
+          echo "SSH_PUB_KEY=$(cat $HOME/.ssh/ci_key.pub)" >> "$GITHUB_ENV"
+
+      - name: Prepare user-data files
+        run: |
+          sed "s|__SSH_PUBLIC_KEY__|${SSH_PUB_KEY}|g" \
+            .github/scripts/user-data-kubeadm.sh > /tmp/user-data-cp.sh
+          sed "s|__SSH_PUBLIC_KEY__|${SSH_PUB_KEY}|g" \
+            .github/scripts/user-data-kubeadm-worker.sh > /tmp/user-data-worker.sh
+
+      - name: Create security group
+        id: sg
+        run: |
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "k3s-to-talos-ci-kmn-${{ github.run_id }}" \
+            --description "CI kubeadm multi-node migration SG for run ${{ github.run_id }}" \
+            --vpc-id "${{ secrets.AWS_VPC_ID }}" \
+            --query 'GroupId' --output text)
+
+          # External access
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 50000 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 6443 --cidr 0.0.0.0/0
+          # Full intra-cluster communication
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol all --port -1 \
+            --source-group "$SG_ID"
+
+          echo "sg-id=$SG_ID" >> "$GITHUB_OUTPUT"
+          echo "Created SG: $SG_ID"
+
+      - name: Launch CP instance
+        id: ec2-cp
+        run: |
+          ID=$(aws ec2 run-instances \
+            --image-id "${{ needs.resolve-amis.outputs.ubuntu-2404 }}" \
+            --instance-type "${{ env.INSTANCE_TYPE }}" \
+            --subnet-id "${{ secrets.AWS_SUBNET_ID }}" \
+            --security-group-ids "${{ steps.sg.outputs.sg-id }}" \
+            --user-data file:///tmp/user-data-cp.sh \
+            --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":20,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+            --tag-specifications \
+              "ResourceType=instance,Tags=[{Key=Name,Value=k3s-to-talos-ci-km-cp},{Key=GHRunId,Value=${{ github.run_id }}}]" \
+            --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
+            --query 'Instances[0].InstanceId' --output text)
+          echo "instance-id=$ID" >> "$GITHUB_OUTPUT"
+          echo "Launched CP: $ID"
+
+      - name: Launch worker instance
+        id: ec2-worker
+        run: |
+          ID=$(aws ec2 run-instances \
+            --image-id "${{ needs.resolve-amis.outputs.ubuntu-2404 }}" \
+            --instance-type "${{ env.INSTANCE_TYPE }}" \
+            --subnet-id "${{ secrets.AWS_SUBNET_ID }}" \
+            --security-group-ids "${{ steps.sg.outputs.sg-id }}" \
+            --user-data file:///tmp/user-data-worker.sh \
+            --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":20,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+            --tag-specifications \
+              "ResourceType=instance,Tags=[{Key=Name,Value=k3s-to-talos-ci-km-worker},{Key=GHRunId,Value=${{ github.run_id }}}]" \
+            --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
+            --query 'Instances[0].InstanceId' --output text)
+          echo "instance-id=$ID" >> "$GITHUB_OUTPUT"
+          echo "Launched worker: $ID"
+
+      - name: Wait for instances running and collect IPs
+        run: |
+          aws ec2 wait instance-running \
+            --instance-ids \
+              "${{ steps.ec2-cp.outputs.instance-id }}" \
+              "${{ steps.ec2-worker.outputs.instance-id }}"
+
+          CP_IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2-cp.outputs.instance-id }}" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          WORKER_IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2-worker.outputs.instance-id }}" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          WORKER_PRIVATE_IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2-worker.outputs.instance-id }}" \
+            --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
+
+          echo "CP_IP=$CP_IP"           >> "$GITHUB_ENV"
+          echo "WORKER_IP=$WORKER_IP"   >> "$GITHUB_ENV"
+          echo "WORKER_PRIVATE_IP=$WORKER_PRIVATE_IP" >> "$GITHUB_ENV"
+          echo "CP public IP:     $CP_IP"
+          echo "Worker public IP: $WORKER_IP (private: $WORKER_PRIVATE_IP)"
+
+      - name: Wait for SSH on both nodes
+        run: |
+          SSH_OPTS="-i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5"
+          for NODE in "$CP_IP" "$WORKER_IP"; do
+            echo "Waiting for SSH on $NODE..."
+            for i in $(seq 1 40); do
+              ssh $SSH_OPTS "ubuntu@$NODE" "exit 0" 2>/dev/null && \
+                { echo "SSH ready on $NODE"; break; }
+              [ "$i" -eq 40 ] && { echo "SSH timeout on $NODE"; exit 1; }
+              sleep 5
+            done
+          done
+
+      - name: Wait for kubeadm ready on CP
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$CP_IP"
+          echo "Waiting for kubeadm CP to become ready (up to 15 minutes)..."
+          for i in $(seq 1 180); do
+            if $SSH "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes 2>/dev/null" \
+                | grep -q " Ready"; then
+              echo "kubeadm CP ready after $((i*5))s"
+              $SSH "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes"
+              break
+            fi
+            [ "$i" -eq 180 ] && { echo "Timeout: kubeadm CP not ready"; exit 1; }
+            sleep 5
+          done
+
+      # Wait for the worker's kubeadm prereqs (containerd + kubelet) to be ready
+      # before joining. The user-data script enables kubelet but kubeadm may not
+      # have finished installing when the CP is ready.
+      - name: Wait for worker node prereqs
+        run: |
+          SSH_W="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$WORKER_IP"
+          echo "Waiting for containerd on worker (up to 5 minutes)..."
+          for i in $(seq 1 60); do
+            if $SSH_W "sudo systemctl is-active containerd 2>/dev/null" | grep -q "^active"; then
+              echo "containerd active on worker after $((i*5))s"
+              break
+            fi
+            [ "$i" -eq 60 ] && { echo "Timeout: containerd not active on worker"; exit 1; }
+            sleep 5
+          done
+
+      - name: Join worker to kubeadm cluster
+        run: |
+          SSH_CP="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$CP_IP"
+          SSH_W="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$WORKER_IP"
+
+          # Get the private IP of the CP (worker joins via internal network).
+          CP_PRIVATE_IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.ec2-cp.outputs.instance-id }}" \
+            --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
+
+          # Generate a fresh join command (includes a short-lived bootstrap token).
+          # kubeadm init used the private IP as the advertise address, so the
+          # join command will naturally reference the private IP — no override needed.
+          # (--apiserver-advertise-address is a kubeadm init flag, not token create.)
+          JOIN_CMD=$($SSH_CP "sudo kubeadm token create --print-join-command 2>/dev/null | tail -1")
+          echo "::add-mask::$(echo $JOIN_CMD | grep -o '[0-9a-h]\{6\}\.[0-9a-z]\{16\}' || true)"
+          echo "Join command obtained (token masked)"
+
+          $SSH_W "sudo $JOIN_CMD"
+          echo "kubeadm join executed on worker"
+
+      - name: Wait for both nodes Ready
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$CP_IP"
+          echo "Waiting for 2 nodes to be Ready (up to 5 minutes)..."
+          for i in $(seq 1 60); do
+            READY=$($SSH "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes --no-headers 2>/dev/null" \
+              | grep -c " Ready" || true)
+            if [ "$READY" -ge 2 ]; then
+              echo "Both nodes Ready after $((i*5))s"
+              $SSH "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes"
+              break
+            fi
+            [ "$i" -eq 60 ] && { echo "Timeout: only $READY/2 nodes Ready"; \
+              $SSH "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes" || true; exit 1; }
+            sleep 5
+          done
+
+      - name: Deploy test workload on kubeadm worker
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$CP_IP"
+          WORKER_NODE=$($SSH "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes --no-headers" \
+            | grep -v "control-plane" | awk '{print $1}')
+          echo "Scheduling nginx on worker node: $WORKER_NODE"
+          $SSH "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf \
+            create deployment ci-test-nginx --image=nginx:alpine --replicas=1 \
+            -- /bin/sh -c 'nginx -g \"daemon off;\"' || true"
+          $SSH "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf \
+            patch deployment ci-test-nginx \
+            -p '{\"spec\":{\"template\":{\"spec\":{\"nodeName\":\"'\"$WORKER_NODE\"'\"}}}}'" || true
+          $SSH "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf get deployment ci-test-nginx"
+
+      - name: Run k3s-to-talos migrate (control plane)
+        run: |
+          mkdir -p test-backup
+          set -o pipefail
+          ./k3s-to-talos migrate \
+            --host "$CP_IP" \
+            --ssh-user ubuntu \
+            --ssh-key "$HOME/.ssh/ci_key" \
+            --sudo \
+            --talos-version "${{ env.TALOS_VERSION }}" \
+            --cluster-name "ci-kubeadm-multinode-test" \
+            --yes \
+            --backup-dir ./test-backup \
+          2>&1 | tee test-backup/migrate-cp.log
+
+      - name: Remove control-plane taint
+        run: |
+          export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
+          echo "Waiting for CP node to be Ready (up to 15 minutes)..."
+          for i in $(seq 1 180); do
+            if kubectl get nodes --no-headers 2>/dev/null | grep -q " Ready"; then
+              echo "Node Ready after $((i*5))s"; kubectl get nodes; break
+            fi
+            [ "$i" -eq 180 ] && { echo "Node not Ready after 15 min"; \
+              kubectl get nodes || true; exit 1; }
+            sleep 5
+          done
+          kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          echo "Re-removing control-plane taint for 90 s to cover kubelet re-registration..."
+          for i in $(seq 1 18); do
+            sleep 5
+            kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
+          done
+          echo "✓ Control-plane taint removed"
+
+      # After migrating from kubeadm (etcd restore), the Talos bootstrap token
+      # does not exist in the restored etcd data. Create it so the worker's
+      # kubelet can authenticate and submit a CSR on first Talos boot.
+      - name: Create Kubernetes bootstrap token for worker join
+        run: |
+          export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
+
+          TOKEN=$(python3 -c "import yaml,sys; cfg=yaml.safe_load(open('test-backup/talos-config/worker.yaml')); tok=cfg.get('cluster',{}).get('token',''); tok or sys.exit(1); print(tok)" \
+            2>/dev/null) || { echo "Warning: could not parse cluster token — worker join may fail"; exit 0; }
+
+          TOKEN_ID="${TOKEN%%.*}"
+          TOKEN_SECRET="${TOKEN##*.}"
+          echo "Cluster token ID: ${TOKEN_ID} (secret length: ${#TOKEN_SECRET})"
+
+          printf '%s\n' \
+            'apiVersion: v1' \
+            'kind: Secret' \
+            'metadata:' \
+            "  name: bootstrap-token-${TOKEN_ID}" \
+            '  namespace: kube-system' \
+            'type: bootstrap.kubernetes.io/token' \
+            'stringData:' \
+            "  token-id: ${TOKEN_ID}" \
+            "  token-secret: ${TOKEN_SECRET}" \
+            '  usage-bootstrap-authentication: "true"' \
+            '  usage-bootstrap-signing: "true"' \
+            '  auth-extra-groups: "system:bootstrappers:kubernetes"' \
+            | kubectl apply -f -
+
+          kubectl create clusterrolebinding talos-bootstrapper-node-token \
+              --clusterrole=system:node-bootstrapper \
+              --group=system:bootstrappers:kubernetes \
+              2>/dev/null || echo "(ClusterRoleBinding already exists)"
+
+          kubectl create clusterrolebinding talos-bootstrapper-csr-nodeclient \
+              --clusterrole=system:certificates.k8s.io:certificatesigningrequests:nodeclient \
+              --group=system:bootstrappers:kubernetes \
+              2>/dev/null || echo "(CSR approval binding already exists)"
+
+          kubectl create clusterrolebinding talos-bootstrapper-csr-selfnodeclient \
+              --clusterrole=system:certificates.k8s.io:certificatesigningrequests:selfnodeclient \
+              --group=system:nodes \
+              2>/dev/null || echo "(self-renewal binding already exists)"
+
+          echo "✓ Bootstrap token and RBAC applied (token-id: ${TOKEN_ID})"
+
+      - name: Worker pre-flight diagnostics
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$WORKER_IP"
+          echo "=== Worker disk layout ==="
+          $SSH "lsblk -o NAME,SIZE,TYPE,MOUNTPOINT" || true
+          echo "=== Worker UEFI NVRAM ==="
+          $SSH "sudo efibootmgr -v 2>&1 || echo 'efibootmgr not available'" || true
+          echo "=== Worker OS ==="
+          $SSH "cat /etc/os-release | grep PRETTY_NAME" || true
+          echo "=== Worker free memory ==="
+          $SSH "free -h" || true
+
+      - name: Kill unattended-upgrades on worker
+        run: |
+          SSH="ssh -i $HOME/.ssh/ci_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@$WORKER_IP"
+          echo "Stopping unattended-upgrades and apt services..."
+          $SSH "sudo systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true"
+          $SSH "sudo systemctl mask apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true"
+          $SSH "sudo killall -9 unattended-upgrade unattended-upgrades apt-get 2>/dev/null || true"
+          echo "Waiting for apt/dpkg lock to be released..."
+          for i in $(seq 1 30); do
+            if ! $SSH "sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null" 2>/dev/null; then
+              echo "apt lock is free after ${i}s"
+              break
+            fi
+            sleep 2
+          done
+          $SSH "sudo dpkg --configure -a 2>/dev/null || true"
+          $SSH "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q zstd efibootmgr gdisk 2>/dev/null || true"
+          echo "✓ unattended-upgrades killed and tools pre-installed"
+
+      - name: Run join-worker (worker node)
+        run: |
+          set -o pipefail
+          ./k3s-to-talos join-worker \
+            --host "$WORKER_IP" \
+            --ssh-user ubuntu \
+            --ssh-key "$HOME/.ssh/ci_key" \
+            --sudo \
+            --talos-version "${{ env.TALOS_VERSION }}" \
+            --worker-config ./test-backup/talos-config/worker.yaml \
+            --talosconfig ./test-backup/talos-config/talosconfig \
+            --backup-dir ./test-backup \
+          2>&1 | tee test-backup/migrate-worker.log
+
+      - name: Show worker migration log
+        if: always()
+        run: |
+          echo "=== migrate-worker.log ==="
+          cat test-backup/migrate-worker.log 2>/dev/null || echo "(log not found)"
+          echo ""
+          echo "=== Worker port status after join-worker ==="
+          nc -w 3 -zv "$WORKER_IP" 22    2>&1 && echo "port 22:    OPEN"  || echo "port 22:    CLOSED"
+          nc -w 3 -zv "$WORKER_IP" 50000 2>&1 && echo "port 50000: OPEN"  || echo "port 50000: CLOSED"
+          echo ""
+          echo "=== Worker EC2 serial console ==="
+          aws ec2 get-console-output \
+            --instance-id "${{ steps.ec2-worker.outputs.instance-id }}" \
+            --latest --output text 2>/dev/null \
+            | tail -80 || echo "(no console output available)"
+
+      - name: Verify both nodes are Talos
+        run: |
+          export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
+          echo "Waiting for 2 Talos nodes to be Ready (up to 15 minutes)..."
+          for i in $(seq 1 180); do
+            READY=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready" || true)
+            if [ "$READY" -ge 2 ]; then
+              echo "✓ Both nodes Ready after $((i*5))s"
+              kubectl get nodes
+              break
+            fi
+            [ $((i % 12)) -eq 0 ] && {
+              echo "--- node status at $((i*5))s ---"
+              kubectl get nodes --no-headers 2>/dev/null || true
+              echo "--- pending CSRs ---"
+              kubectl get csr --no-headers 2>/dev/null | head -10 || true
+            }
+            [ "$i" -eq 180 ] && {
+              echo "✗ Only $READY/2 nodes Ready after 15 min"
+              kubectl get nodes -o wide || true
+              kubectl get csr 2>/dev/null || true
+              exit 1
+            }
+            sleep 5
+          done
+
+      - name: Verify ci-test-nginx is Running on Talos cluster
+        run: |
+          export KUBECONFIG="$(pwd)/test-backup/talos-kubeconfig"
+          echo "Waiting for ci-test-nginx pods to be Running (up to 15 minutes)..."
+          for i in $(seq 1 180); do
+            RUNNING=$(kubectl get pods -l app=ci-test-nginx \
+              --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+            if [ "$RUNNING" -ge 1 ]; then
+              echo "✓ ci-test-nginx is Running on Talos cluster after kubeadm multi-node migration"
+              kubectl get pods -l app=ci-test-nginx
+              break
+            fi
+            [ "$i" -eq 180 ] && { echo "✗ ci-test-nginx not Running after 15 min"; \
+              kubectl get pods; kubectl describe pods -l app=ci-test-nginx; exit 1; }
+            sleep 5
+          done
+
+      - name: Diagnose machine state
+        if: always()
+        run: |
+          TALOSCFG="./test-backup/talos-config/talosconfig"
+          echo "=== CP port connectivity ==="
+          nc -w 3 -zv "$CP_IP" 50000 2>&1 && echo "50000: OPEN" || echo "50000: CLOSED"
+          nc -w 3 -zv "$CP_IP" 6443  2>&1 && echo "6443: OPEN"  || echo "6443: CLOSED"
+          echo "=== CP talosctl version ==="
+          [ -f "$TALOSCFG" ] && talosctl --talosconfig "$TALOSCFG" version \
+            --nodes "$CP_IP" --endpoints "$CP_IP" 2>&1 || true
+          echo "=== Worker port connectivity ==="
+          nc -w 3 -zv "$WORKER_IP" 50000 2>&1 && echo "50000: OPEN" || echo "50000: CLOSED"
+          echo "=== Worker talosctl version ==="
+          [ -f "$TALOSCFG" ] && talosctl --talosconfig "$TALOSCFG" version \
+            --nodes "$WORKER_IP" --endpoints "$WORKER_IP" 2>&1 || true
+
+      - name: Upload backup artefact (multi-node kubeadm)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-multinode-kubeadm-ubuntu-24.04
+          path: test-backup/
+          retention-days: 3
+
+      - name: Terminate instances
+        if: always()
+        run: |
+          aws ec2 terminate-instances \
+            --instance-ids \
+              "${{ steps.ec2-cp.outputs.instance-id }}" \
+              "${{ steps.ec2-worker.outputs.instance-id }}" \
+            2>/dev/null || true
+
+      - name: Delete security group
+        if: always()
+        run: |
+          SG="${{ steps.sg.outputs.sg-id }}"
+          [ -z "$SG" ] && exit 0
+          for i in $(seq 1 12); do
+            aws ec2 delete-security-group --group-id "$SG" 2>/dev/null && break
+            sleep 5
+          done
+
+  # ── Centralised cleanup — runs even if the job is cancelled ───────────────────
+  cleanup:
+    name: Cleanup EC2 resources
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [ec2-test, ec2-test-multinode, ec2-test-kubeadm, ec2-test-multinode-kubeadm]
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terminate all instances for this run
+        run: |
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:GHRunId,Values=${{ github.run_id }}" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)
+
+          if [ -n "$INSTANCE_IDS" ]; then
+            echo "Terminating: $INSTANCE_IDS"
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS
+            aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS
+          else
+            echo "No instances to terminate"
+          fi
+
+      - name: Delete security groups for this run
+        run: |
+          SG_IDS=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=k3s-to-talos-ci-${{ github.run_id }}*" \
+            --query 'SecurityGroups[].GroupId' \
+            --output text)
+
+          for sg in $SG_IDS; do
+            aws ec2 delete-security-group --group-id "$sg" 2>/dev/null && \
+              echo "Deleted $sg" || echo "Could not delete $sg (may already be gone)"
+          done
