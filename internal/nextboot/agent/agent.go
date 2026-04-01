@@ -309,15 +309,17 @@ func Run(opts Options) error {
 // ── Disk detection ───────────────────────────────────────────────────────────
 
 func detectBootDisk() (string, error) {
+	// Ask findmnt for the block device backing /.
 	if out, err := exec.Command("findmnt", "-n", "-o", "SOURCE", "/").Output(); err == nil {
 		src := strings.TrimSpace(string(out))
-		disk := regexp.MustCompile(`(p\d+|\d+)$`).ReplaceAllString(src, "")
-		if disk != "" {
-			if _, err := os.Stat(disk); err == nil {
-				return disk, nil
-			}
+		// resolveDevToDisk handles partitions (/dev/sda3), LVM logical
+		// volumes (/dev/mapper/...), and plain disks (/dev/sda) uniformly
+		// by walking up the lsblk ancestor chain to the TYPE=disk entry.
+		if disk := resolveDevToDisk(src); disk != "" {
+			return disk, nil
 		}
 	}
+	// Fallback: first disk-type device reported by lsblk.
 	if out, err := exec.Command("lsblk", "-dno", "NAME,TYPE").Output(); err == nil {
 		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 			if fields := strings.Fields(line); len(fields) == 2 && fields[1] == "disk" {
@@ -326,6 +328,42 @@ func detectBootDisk() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("could not auto-detect boot disk; specify --disk explicitly")
+}
+
+// resolveDevToDisk resolves any block device — a partition, an LVM logical
+// volume, or a plain disk — to the underlying physical disk by walking up
+// the lsblk ancestor chain (-s flag) until a TYPE=disk entry is found.
+//
+// Examples:
+//
+//	/dev/sda3                        → /dev/sda
+//	/dev/nvme0n1p2                   → /dev/nvme0n1
+//	/dev/mapper/ubuntu--vg-ubuntu--lv → /dev/sda   (LVM on partition)
+func resolveDevToDisk(device string) string {
+	// -s: show ancestors; -p: full /dev/… paths; -n: no headers; -o NAME,TYPE
+	out, err := exec.Command("lsblk", "-spno", "NAME,TYPE", device).Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		// lsblk may prefix the NAME field with tree-drawing characters (├─, └─)
+		// when -s is active.  Find the /dev/… field and the type field
+		// independently so tree art never causes a mismatch.
+		var name, typ string
+		for _, f := range fields {
+			switch {
+			case strings.HasPrefix(f, "/dev/"):
+				name = f
+			case f == "disk" || f == "part" || f == "lvm" || f == "crypt":
+				typ = f
+			}
+		}
+		if name != "" && typ == "disk" {
+			return name
+		}
+	}
+	return ""
 }
 
 // ── Tool installation ────────────────────────────────────────────────────────
