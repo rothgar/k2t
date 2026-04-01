@@ -319,12 +319,19 @@ func detectBootDisk() (string, error) {
 			return disk, nil
 		}
 	}
-	// Fallback: first disk-type device reported by lsblk.
-	if out, err := exec.Command("lsblk", "-dno", "NAME,TYPE").Output(); err == nil {
+	// Fallback: first non-removable, non-empty disk reported by lsblk.
+	// Use -b (bytes) so SIZE is an integer — easy to compare against 0.
+	// RM=1 means removable (card readers, USB slots with no media).
+	if out, err := exec.Command("lsblk", "-bdno", "NAME,TYPE,SIZE,RM").Output(); err == nil {
 		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			if fields := strings.Fields(line); len(fields) == 2 && fields[1] == "disk" {
-				return "/dev/" + fields[0], nil
+			f := strings.Fields(line)
+			if len(f) < 4 || f[1] != "disk" {
+				continue
 			}
+			if f[2] == "0" || f[3] == "1" { // skip empty or removable
+				continue
+			}
+			return "/dev/" + f[0], nil
 		}
 	}
 	return "", fmt.Errorf("could not auto-detect boot disk; specify --disk explicitly")
@@ -332,7 +339,8 @@ func detectBootDisk() (string, error) {
 
 // resolveDevToDisk resolves any block device — a partition, an LVM logical
 // volume, or a plain disk — to the underlying physical disk by walking up
-// the lsblk ancestor chain (-s flag) until a TYPE=disk entry is found.
+// the lsblk ancestor chain (-s flag) until a non-empty, non-removable
+// TYPE=disk entry is found.
 //
 // Examples:
 //
@@ -340,26 +348,30 @@ func detectBootDisk() (string, error) {
 //	/dev/nvme0n1p2                   → /dev/nvme0n1
 //	/dev/mapper/ubuntu--vg-ubuntu--lv → /dev/sda   (LVM on partition)
 func resolveDevToDisk(device string) string {
-	// -s: show ancestors; -p: full /dev/… paths; -n: no headers; -o NAME,TYPE
-	out, err := exec.Command("lsblk", "-spno", "NAME,TYPE", device).Output()
+	// -s: show ancestors; -p: full /dev/… paths; -b: byte sizes; -n: no headers
+	out, err := exec.Command("lsblk", "-spbno", "NAME,TYPE,SIZE,RM", device).Output()
 	if err != nil {
 		return ""
 	}
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		fields := strings.Fields(line)
 		// lsblk may prefix the NAME field with tree-drawing characters (├─, └─)
-		// when -s is active.  Find the /dev/… field and the type field
+		// when -s is active.  Find the /dev/… field and the type/size/rm fields
 		// independently so tree art never causes a mismatch.
-		var name, typ string
+		var name, typ, size, rm string
 		for _, f := range fields {
 			switch {
 			case strings.HasPrefix(f, "/dev/"):
 				name = f
 			case f == "disk" || f == "part" || f == "lvm" || f == "crypt":
 				typ = f
+			case size == "" && f != "" && f[0] >= '0' && f[0] <= '9':
+				size = f
+			case rm == "" && (f == "0" || f == "1"):
+				rm = f
 			}
 		}
-		if name != "" && typ == "disk" {
+		if name != "" && typ == "disk" && size != "0" && rm != "1" {
 			return name
 		}
 	}
