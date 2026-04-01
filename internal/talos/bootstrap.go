@@ -161,7 +161,16 @@ func (b *Bootstrapper) Bootstrap(opts BootstrapOptions) error {
 	}
 	color.Green("  ✓ Kubeconfig saved to %s\n", opts.KubeconfigOut)
 
-	// Step 5: Wait for Kubernetes API
+	// Step 5: If we restored from a k3s etcd snapshot, delete stale node objects
+	// left over from the k3s era.  The k3s etcd snapshot contains node
+	// registrations that don't match the new Talos kubelet's identity, causing
+	// `talosctl health` to report "unexpected nodes with IPs [...]".  Deleting
+	// them allows the Talos kubelet to re-register cleanly.
+	if opts.EtcdSnapshotPath != "" {
+		b.cleanupStaleNodes(opts.KubeconfigOut)
+	}
+
+	// Step 6: Wait for Kubernetes API
 	if err := b.waitForKubernetesAPI(opts.Host, opts.TalosConfigFile); err != nil {
 		return err
 	}
@@ -640,6 +649,85 @@ func (b *Bootstrapper) waitForTalosctlReady(talosctlPath, talosConfigFile, host,
 	s.Stop()
 	return fmt.Errorf("Talos gRPC API at %s did not become ready within 35 minutes "+
 		"(%d apply-config retries sent)", host, applyRetryCount)
+}
+
+// cleanupStaleNodes deletes Kubernetes node objects that are NotReady or
+// Unknown.  This is needed after restoring a k3s etcd snapshot: the snapshot
+// contains node registrations from the old k3s cluster.  When Talos boots its
+// kubelet it may register under a different name (or the same name but with a
+// fresh identity), leaving the old entry as NotReady/Unknown.  The mismatch
+// causes `talosctl health` to report "unexpected nodes with IPs [...]".
+//
+// The function waits up to 3 minutes for the kube-apiserver to accept kubectl
+// requests, then deletes any NotReady/Unknown nodes.  Non-fatal: failures are
+// logged as warnings so the migration is not aborted.
+func (b *Bootstrapper) cleanupStaleNodes(kubeconfigPath string) {
+	kubectlPath, err := exec.LookPath("kubectl")
+	if err != nil {
+		color.Yellow("  (kubectl not found — skipping stale k3s node cleanup; run manually if needed)\n")
+		return
+	}
+
+	fmt.Println("  Waiting for Kubernetes API to accept kubectl requests (stale node cleanup)...")
+	deadline := time.Now().Add(3 * time.Minute)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cmd := exec.CommandContext(ctx, kubectlPath,
+			"--kubeconfig", kubeconfigPath,
+			"get", "nodes", "--no-headers",
+			"-o", "custom-columns=NAME:.metadata.name,STATUS:.status.conditions[-1:].type,READY:.status.conditions[-1:].status",
+		)
+		out, err := cmd.Output()
+		cancel()
+		if err == nil {
+			lastOut = out
+			break
+		}
+		time.Sleep(10 * time.Second)
+	}
+
+	if lastOut == nil {
+		color.Yellow("  Warning: Kubernetes API not ready for stale node cleanup — skipping\n")
+		return
+	}
+
+	deleted := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(lastOut)), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		nodeName, condType, condStatus := fields[0], fields[1], fields[2]
+		// A healthy node has condition type=Ready, status=True.
+		// Stale k3s nodes will have Ready=Unknown or no conditions at all.
+		isStale := (condType == "Ready" && condStatus != "True") ||
+			condType == "<none>" || condStatus == "Unknown"
+		if !isStale {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		delCmd := exec.CommandContext(ctx, kubectlPath,
+			"--kubeconfig", kubeconfigPath,
+			"delete", "node", nodeName, "--ignore-not-found",
+		)
+		delOut, delErr := delCmd.CombinedOutput()
+		cancel()
+		if delErr != nil {
+			color.Yellow("  Warning: could not delete stale node %s: %v (%s)\n",
+				nodeName, delErr, strings.TrimSpace(string(delOut)))
+		} else {
+			color.Green("  ✓ Deleted stale k3s node object: %s\n", nodeName)
+			deleted++
+		}
+	}
+
+	if deleted == 0 {
+		fmt.Println("  No stale k3s node objects found.")
+	}
 }
 
 // waitForKubernetesAPI polls kubectl until the API server responds.
