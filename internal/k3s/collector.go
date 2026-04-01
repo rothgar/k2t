@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/briandowns/spinner"
-	"github.com/rothgar/k3s-to-talos/internal/ssh"
-	"github.com/rothgar/k3s-to-talos/internal/talos"
+	"github.com/rothgar/k2t/internal/ssh"
+	"github.com/rothgar/k2t/internal/talos"
 )
 
 // ClusterInfo holds information about the cluster gathered remotely.

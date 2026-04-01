@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/rothgar/k3s-to-talos/cmd"
+	"github.com/rothgar/k2t/cmd"
 )
 
 func main() {

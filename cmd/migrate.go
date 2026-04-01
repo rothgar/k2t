@@ -10,11 +10,11 @@ import (
 	"time"
 
 	"github.com/fatih/color"
-	"github.com/rothgar/k3s-to-talos/internal/k3s"
-	"github.com/rothgar/k3s-to-talos/internal/nextboot"
-	"github.com/rothgar/k3s-to-talos/internal/ssh"
-	"github.com/rothgar/k3s-to-talos/internal/talos"
-	"github.com/rothgar/k3s-to-talos/internal/ui"
+	"github.com/rothgar/k2t/internal/k3s"
+	"github.com/rothgar/k2t/internal/nextboot"
+	"github.com/rothgar/k2t/internal/ssh"
+	"github.com/rothgar/k2t/internal/talos"
+	"github.com/rothgar/k2t/internal/ui"
 	"github.com/spf13/cobra"
 )
 

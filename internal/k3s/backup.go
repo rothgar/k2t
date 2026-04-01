@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/briandowns/spinner"
-	"github.com/rothgar/k3s-to-talos/internal/ssh"
+	"github.com/rothgar/k2t/internal/ssh"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"

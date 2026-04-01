@@ -9,8 +9,8 @@ import (
 
 	"github.com/briandowns/spinner"
 	"github.com/fatih/color"
-	"github.com/rothgar/k3s-to-talos/internal/ssh"
-	"github.com/rothgar/k3s-to-talos/internal/talos"
+	"github.com/rothgar/k2t/internal/ssh"
+	"github.com/rothgar/k2t/internal/talos"
 )
 
 // Options holds parameters for the nextboot-talos installer.

@@ -1,4 +1,4 @@
-module github.com/rothgar/k3s-to-talos
+module github.com/rothgar/k2t
 
 go 1.22
 

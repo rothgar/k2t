@@ -5,7 +5,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/rothgar/k3s-to-talos/internal/k3s"
+	"github.com/rothgar/k2t/internal/k3s"
 )
 
 // MigrationState tracks progress across phases so runs can be resumed.

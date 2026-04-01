@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	sshconfig "github.com/kevinburke/ssh_config"
-	"github.com/rothgar/k3s-to-talos/internal/ssh"
+	"github.com/rothgar/k2t/internal/ssh"
 	"github.com/spf13/cobra"
 )
 

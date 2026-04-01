@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/rothgar/k3s-to-talos/internal/talos"
-	"github.com/rothgar/k3s-to-talos/internal/ui"
+	"github.com/rothgar/k2t/internal/talos"
+	"github.com/rothgar/k2t/internal/ui"
 	"github.com/spf13/cobra"
 )
 

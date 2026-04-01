@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	"github.com/fatih/color"
-	"github.com/rothgar/k3s-to-talos/internal/k3s"
-	"github.com/rothgar/k3s-to-talos/internal/talos"
+	"github.com/rothgar/k2t/internal/k3s"
+	"github.com/rothgar/k2t/internal/talos"
 )
 
 var (

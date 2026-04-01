@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/fatih/color"
-	"github.com/rothgar/k3s-to-talos/internal/ssh"
+	"github.com/rothgar/k2t/internal/ssh"
 )
 
 // MigrateToEtcd converts a k3s server running SQLite to embedded etcd using

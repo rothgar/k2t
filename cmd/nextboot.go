@@ -1,7 +1,7 @@
 package cmd
 
 import (
-	"github.com/rothgar/k3s-to-talos/internal/nextboot/agent"
+	"github.com/rothgar/k2t/internal/nextboot/agent"
 	"github.com/spf13/cobra"
 )
 

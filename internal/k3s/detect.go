@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/rothgar/k3s-to-talos/internal/ssh"
+	"github.com/rothgar/k2t/internal/ssh"
 )
 
 // Cluster type constants.
