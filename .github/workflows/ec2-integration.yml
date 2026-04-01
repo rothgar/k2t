@@ -208,10 +208,8 @@ jobs:
           # pipefail ensures the exit code comes from migrate, not tee.
           set -o pipefail
           ./k3s-to-talos migrate \
-            --host "$NODE_IP" \
-            --ssh-user ubuntu \
+            --host "ubuntu@$NODE_IP" \
             --ssh-key "$HOME/.ssh/ci_key" \
-            --sudo \
             --talos-version "${{ env.TALOS_VERSION }}" \
             --cluster-name "ci-migration-test" \
             --yes \
@@ -586,10 +584,8 @@ jobs:
           mkdir -p test-backup
           set -o pipefail
           ./k3s-to-talos migrate \
-            --host "$CP_IP" \
-            --ssh-user ubuntu \
+            --host "ubuntu@$CP_IP" \
             --ssh-key "$HOME/.ssh/ci_key" \
-            --sudo \
             --talos-version "${{ env.TALOS_VERSION }}" \
             --cluster-name "ci-multinode-test" \
             --yes \
@@ -776,10 +772,8 @@ jobs:
         run: |
           set -o pipefail
           ./k3s-to-talos join-worker \
-            --host "$WORKER_IP" \
-            --ssh-user ubuntu \
+            --host "ubuntu@$WORKER_IP" \
             --ssh-key "$HOME/.ssh/ci_key" \
-            --sudo \
             --talos-version "${{ env.TALOS_VERSION }}" \
             --worker-config ./test-backup/talos-config/worker.yaml \
             --talosconfig ./test-backup/talos-config/talosconfig \
@@ -1045,10 +1039,8 @@ jobs:
           mkdir -p test-backup
           set -o pipefail
           ./k3s-to-talos migrate \
-            --host "$NODE_IP" \
-            --ssh-user ubuntu \
+            --host "ubuntu@$NODE_IP" \
             --ssh-key "$HOME/.ssh/ci_key" \
-            --sudo \
             --talos-version "${{ env.TALOS_VERSION }}" \
             --cluster-name "ci-kubeadm-test" \
             --yes \
@@ -1387,10 +1379,8 @@ jobs:
           mkdir -p test-backup
           set -o pipefail
           ./k3s-to-talos migrate \
-            --host "$CP_IP" \
-            --ssh-user ubuntu \
+            --host "ubuntu@$CP_IP" \
             --ssh-key "$HOME/.ssh/ci_key" \
-            --sudo \
             --talos-version "${{ env.TALOS_VERSION }}" \
             --cluster-name "ci-kubeadm-multinode-test" \
             --yes \
@@ -1498,10 +1488,8 @@ jobs:
         run: |
           set -o pipefail
           ./k3s-to-talos join-worker \
-            --host "$WORKER_IP" \
-            --ssh-user ubuntu \
+            --host "ubuntu@$WORKER_IP" \
             --ssh-key "$HOME/.ssh/ci_key" \
-            --sudo \
             --talos-version "${{ env.TALOS_VERSION }}" \
             --worker-config ./test-backup/talos-config/worker.yaml \
             --talosconfig ./test-backup/talos-config/talosconfig \
