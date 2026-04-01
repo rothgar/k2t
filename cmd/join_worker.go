@@ -20,7 +20,7 @@ var (
 )
 
 var joinWorkerCmd = &cobra.Command{
-	Use:   "join-worker",
+	Use:   "join-worker [[user@]host]",
 	Short: "Convert a k3s agent node to a Talos worker and join an existing Talos cluster",
 	Long: `Installs Talos on a k3s agent (worker) node and joins it to an existing
 Talos cluster that was previously migrated with the 'migrate' command.
@@ -49,26 +49,22 @@ func init() {
 }
 
 func runJoinWorker(cmd *cobra.Command, args []string) error {
-	if flagHost == "" {
-		return fmt.Errorf("--host is required")
+	target := resolveTarget(args)
+	if target == "" {
+		return fmt.Errorf("SSH target is required: k2t join-worker [user@]host")
 	}
+	host := sshOpts(target).Host
 
 	if err := os.MkdirAll(flagBackupDir, 0750); err != nil {
 		return fmt.Errorf("creating backup directory: %w", err)
 	}
 
-	color.Blue("\n══ Joining worker node %s to Talos cluster ══\n\n", flagHost)
+	color.Blue("\n══ Joining worker node %s to Talos cluster ══\n\n", host)
 
 	// ── Phase 1: Deploy Talos via nextboot ───────────────────────────────────
 	color.Blue("[1/2] Deploying Talos to worker node via nextboot agent\n")
 
-	sshClient, err := ssh.NewClient(ssh.Options{
-		Host:    flagHost,
-		Port:    flagSSHPort,
-		User:    flagSSHUser,
-		KeyPath: flagSSHKey,
-		Sudo:    flagSudo,
-	})
+	sshClient, err := ssh.NewClient(sshOpts(target))
 	if err != nil {
 		return fmt.Errorf("SSH connection to worker failed: %w", err)
 	}
@@ -79,14 +75,14 @@ func runJoinWorker(cmd *cobra.Command, args []string) error {
 	// not already in the config, machined's TLS cert won't include the public IP
 	// and every CA-verified talosctl call via the public IP will fail with an
 	// x509 SAN mismatch.
-	workerCfgToUpload, cleanCfg, patchErr := patchWorkerConfigCertSANs(filepath.Clean(flagWorkerConfig), flagHost)
+	workerCfgToUpload, cleanCfg, patchErr := patchWorkerConfigCertSANs(filepath.Clean(flagWorkerConfig), host)
 	if patchErr != nil {
 		color.Yellow("  Warning: could not patch worker.yaml with certSANs: %v\n", patchErr)
 		color.Yellow("  Using unpatched worker.yaml — CA-verified talosctl may fail if public IP is not in SANs.\n")
 		workerCfgToUpload = filepath.Clean(flagWorkerConfig)
 		cleanCfg = func() {}
 	} else {
-		fmt.Printf("  ✓ worker.yaml patched with machine.certSANs=[%s]\n", flagHost)
+		fmt.Printf("  ✓ worker.yaml patched with machine.certSANs=[%s]\n", host)
 	}
 
 	installer := nextboot.NewInstaller(sshClient, flagBackupDir)
@@ -109,14 +105,14 @@ func runJoinWorker(cmd *cobra.Command, args []string) error {
 
 	bootstrapper := talos.NewBootstrapper(flagBackupDir)
 	if err := bootstrapper.BootstrapWorker(talos.WorkerBootstrapOptions{
-		Host:            flagHost,
+		Host:            host,
 		TalosConfigFile: filepath.Clean(flagTalosConfig),
 		WorkerCfgFile:   filepath.Clean(flagWorkerConfig),
 	}); err != nil {
 		return fmt.Errorf("bootstrapping worker: %w", err)
 	}
 
-	color.Green("\n✓ Worker node %s is now running Talos and has joined the cluster.\n", flagHost)
+	color.Green("\n✓ Worker node %s is now running Talos and has joined the cluster.\n", host)
 	fmt.Printf("\nVerify with:\n  talosctl --talosconfig %s get members\n", flagTalosConfig)
 	return nil
 }

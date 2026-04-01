@@ -28,7 +28,7 @@ var (
 )
 
 var migrateCmd = &cobra.Command{
-	Use:   "migrate",
+	Use:   "migrate [[user@]host]",
 	Short: "Migrate a k3s server node to Talos Linux (full flow)",
 	Long: `Performs the full migration of a k3s server node to Talos Linux.
 
@@ -53,16 +53,18 @@ func init() {
 }
 
 func runMigrate(cmd *cobra.Command, args []string) error {
-	if flagHost == "" {
-		return fmt.Errorf("--host is required")
+	target := resolveTarget(args)
+	if target == "" {
+		return fmt.Errorf("SSH target is required: k2t migrate [user@]host")
 	}
+	host := sshOpts(target).Host
 
 	if err := os.MkdirAll(flagBackupDir, 0750); err != nil {
 		return fmt.Errorf("creating backup directory: %w", err)
 	}
 
 	stateFile := filepath.Join(flagBackupDir, "migration-state.json")
-	state, err := loadOrInitState(stateFile, flagHost)
+	state, err := loadOrInitState(stateFile, host)
 	if err != nil {
 		return err
 	}
@@ -75,13 +77,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	if !state.PhaseCompleted("COLLECT") || !flagResume {
 		ui.PrintPhaseHeader(1, "COLLECT", "Connecting to k3s node and backing up cluster state")
 
-		sshClient, err := ssh.NewClient(ssh.Options{
-			Host:    flagHost,
-			Port:    flagSSHPort,
-			User:    flagSSHUser,
-			KeyPath: flagSSHKey,
-			Sudo:    flagSudo,
-		})
+		sshClient, err := ssh.NewClient(sshOpts(target))
 		if err != nil {
 			return fmt.Errorf("SSH connection failed: %w", err)
 		}
@@ -133,7 +129,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		backup := k3s.NewBackup(sshClient, flagBackupDir, flagHost)
+		backup := k3s.NewBackup(sshClient, flagBackupDir, host)
 		if err := backup.Run(info, flagDryRun); err != nil {
 			return fmt.Errorf("backing up k3s data: %w", err)
 		}
@@ -160,10 +156,10 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		ui.PrintRaspberryPiWarning(state.ClusterInfo.Hardware)
 	}
 
-	ui.PrintIrreversibilityWarning(flagHost)
+	ui.PrintIrreversibilityWarning(host)
 
 	if !flagDryRun && !flagYes {
-		if err := ui.ConfirmErase(flagHost); err != nil {
+		if err := ui.ConfirmErase(host); err != nil {
 			return err
 		}
 	} else if flagYes {
@@ -198,7 +194,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		gen := talos.NewConfigGenerator(flagBackupDir)
 		if err := gen.Generate(talos.GenerateOptions{
 			ClusterName:                   clusterName,
-			ControlPlaneIP:                flagHost,
+			ControlPlaneIP:                host,
 			TalosVersion:                  flagTalosVersion,
 			OutputDir:                     talosConfigDir,
 			DryRun:                        flagDryRun,
@@ -231,13 +227,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	if !state.PhaseCompleted("DEPLOY") || !flagResume {
 		ui.PrintPhaseHeader(4, "DEPLOY", "Installing nextboot-talos and rebooting into Talos")
 
-		sshClient, err := ssh.NewClient(ssh.Options{
-			Host:    flagHost,
-			Port:    flagSSHPort,
-			User:    flagSSHUser,
-			KeyPath: flagSSHKey,
-			Sudo:    flagSudo,
-		})
+		sshClient, err := ssh.NewClient(sshOpts(target))
 		if err != nil {
 			return fmt.Errorf("reconnecting via SSH: %w", err)
 		}
@@ -245,7 +235,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		installer := nextboot.NewInstaller(sshClient, flagBackupDir)
 		if err := installer.Run(nextboot.Options{
 			TalosVersion:   flagTalosVersion,
-			ControlPlaneIP: flagHost,
+			ControlPlaneIP: host,
 			ConfigFile:     filepath.Join(state.TalosConfigDir, "controlplane.yaml"),
 			Hardware:       state.ClusterInfo.Hardware,
 		}); err != nil {
@@ -284,7 +274,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 
 		bootstrapper := talos.NewBootstrapper(flagBackupDir)
 		if err := bootstrapper.Bootstrap(talos.BootstrapOptions{
-			Host:             flagHost,
+			Host:             host,
 			TalosConfigFile:  talosConfigFile,
 			ControlPlaneCfg:  controlPlaneCfg,
 			KubeconfigOut:    kubeconfigOut,

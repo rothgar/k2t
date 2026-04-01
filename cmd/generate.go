@@ -38,10 +38,10 @@ func init() {
 func runGenerate(cmd *cobra.Command, args []string) error {
 	endpoint := flagControlPlaneEndpoint
 	if endpoint == "" {
-		endpoint = flagHost
+		endpoint = resolveHost(args)
 	}
 	if endpoint == "" {
-		return fmt.Errorf("--cluster-endpoint or --host is required")
+		return fmt.Errorf("--cluster-endpoint or a [user@]host argument is required")
 	}
 
 	talosConfigDir := filepath.Join(flagBackupDir, "talos-config")

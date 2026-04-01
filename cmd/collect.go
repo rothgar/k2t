@@ -14,7 +14,7 @@ import (
 var flagCollectMigrateToEtcd bool
 
 var collectCmd = &cobra.Command{
-	Use:   "collect",
+	Use:   "collect [[user@]host]",
 	Short: "Collect k3s cluster info and create a backup (no migration)",
 	Long: `Connects to the remote k3s server via SSH and collects cluster information
 including nodes, workloads, secrets, configmaps, and persistent volumes.
@@ -33,8 +33,9 @@ func init() {
 }
 
 func runCollect(cmd *cobra.Command, args []string) error {
-	if flagHost == "" {
-		return fmt.Errorf("--host is required")
+	target := resolveTarget(args)
+	if target == "" {
+		return fmt.Errorf("SSH target is required: k2t collect [user@]host")
 	}
 
 	if err := os.MkdirAll(flagBackupDir, 0750); err != nil {
@@ -43,13 +44,7 @@ func runCollect(cmd *cobra.Command, args []string) error {
 
 	ui.PrintPhaseHeader(1, "COLLECT", "Connecting to k3s node and backing up cluster state")
 
-	sshClient, err := ssh.NewClient(ssh.Options{
-		Host:    flagHost,
-		Port:    flagSSHPort,
-		User:    flagSSHUser,
-		KeyPath: flagSSHKey,
-		Sudo:    flagSudo,
-	})
+	sshClient, err := ssh.NewClient(sshOpts(target))
 	if err != nil {
 		return fmt.Errorf("SSH connection failed: %w", err)
 	}
@@ -87,7 +82,7 @@ func runCollect(cmd *cobra.Command, args []string) error {
 		color.Green("  ✓ Datastore converted to embedded etcd\n")
 	}
 
-	backup := k3s.NewBackup(sshClient, flagBackupDir, flagHost)
+	backup := k3s.NewBackup(sshClient, flagBackupDir, sshOpts(target).Host)
 	if err := backup.Run(info, false); err != nil {
 		return fmt.Errorf("backing up k3s data: %w", err)
 	}

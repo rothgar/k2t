@@ -22,7 +22,7 @@ type Options struct {
 	Port    int
 	User    string
 	KeyPath string
-	Sudo    bool // prefix privileged commands with sudo (for non-root users)
+	Sudo    bool // prefix privileged commands with sudo; auto-set when User != "root"
 }
 
 // Client wraps an SSH connection and provides helpers for remote execution
@@ -40,6 +40,10 @@ func NewClient(opts Options) (*Client, error) {
 	}
 	if opts.Port == 0 {
 		opts.Port = 22
+	}
+	// Automatically use sudo for non-root users.
+	if opts.User != "root" {
+		opts.Sudo = true
 	}
 
 	authMethods, err := buildAuthMethods(opts.KeyPath)
