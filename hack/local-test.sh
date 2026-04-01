@@ -499,11 +499,9 @@ run_migrate() {
   local host="$1" ssh_port="$2"
   log_info "Running k2t migrate on ${host}:${ssh_port}…"
   "${BINARY}" migrate \
-    --host "${host}" \
+    --host "ubuntu@${host}" \
     --ssh-port "${ssh_port}" \
-    --ssh-user ubuntu \
     --ssh-key "${WORK_DIR}/ci_key" \
-    --sudo \
     --talos-version "${TALOS_VERSION}" \
     --cluster-name local-test \
     --yes \
@@ -518,10 +516,8 @@ run_join_worker() {
   local host="$1"
   log_info "Running k2t join-worker on ${host}…"
   "${BINARY}" join-worker \
-    --host "${host}" \
-    --ssh-user ubuntu \
+    --host "ubuntu@${host}" \
     --ssh-key "${WORK_DIR}/ci_key" \
-    --sudo \
     --talos-version "${TALOS_VERSION}" \
     --worker-config "${WORK_DIR}/backup/talos-config/worker.yaml" \
     --talosconfig "${WORK_DIR}/backup/talos-config/talosconfig" \
