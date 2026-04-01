@@ -39,6 +39,12 @@ type GenerateOptions struct {
 	// VXLAN interface, breaking pod networking after the restore.
 	// Leave empty to use the Talos default ("flannel").
 	CNIName string // e.g. "none"
+	// AllowedUnsafeSysctls is the list of unsafe sysctls to whitelist in the
+	// kubelet configuration (machine.kubelet.extraConfig.allowedUnsafeSysctls).
+	// Applied as a shared patch (both control plane and worker) so that
+	// workloads requiring those sysctls can run on any node type.
+	// Populated from workload detection during the collect phase.
+	AllowedUnsafeSysctls []string // e.g. ["net.ipv4.ip_forward", "net.ipv4.conf.all.forwarding"]
 }
 
 // ConfigGenerator runs talosctl gen config to produce machine configs.
@@ -114,6 +120,17 @@ func (g *ConfigGenerator) Generate(opts GenerateOptions) error {
 		}
 	}
 
+	// Shared machine patch — applied to both control-plane and worker configs.
+	// Currently used for kubelet.extraConfig when workloads require unsafe sysctls
+	// (e.g. k3s ServiceLB / klipper-lb).
+	sharedPatch := ""
+	if len(opts.AllowedUnsafeSysctls) > 0 {
+		sharedPatch = "machine:\n  kubelet:\n    extraConfig:\n      allowedUnsafeSysctls:\n"
+		for _, s := range opts.AllowedUnsafeSysctls {
+			sharedPatch += fmt.Sprintf("        - %q\n", s)
+		}
+	}
+
 	args := []string{
 		"gen", "config",
 		opts.ClusterName,
@@ -122,6 +139,9 @@ func (g *ConfigGenerator) Generate(opts GenerateOptions) error {
 		"--output-types", "controlplane,worker,talosconfig",
 		"--config-patch-control-plane", cpPatch,
 		"--force",
+	}
+	if sharedPatch != "" {
+		args = append(args, "--config-patch", sharedPatch)
 	}
 
 	if opts.TalosVersion != "" {

@@ -203,6 +203,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 			ServiceCIDR:                   state.ClusterInfo.ServiceCIDR,
 			AllowSchedulingOnControlPlane: state.ClusterInfo.AllowSchedulingOnControlPlane,
 			CNIName:                       cniName,
+			AllowedUnsafeSysctls:          state.ClusterInfo.WorkloadFeatures.AllowedUnsafeSysctls,
 		}); err != nil {
 			return fmt.Errorf("generating Talos config: %w", err)
 		}

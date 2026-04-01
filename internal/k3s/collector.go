@@ -33,6 +33,21 @@ type ClusterInfo struct {
 	// generator uses this to set cluster.allowSchedulingOnControlPlane so the
 	// generated cluster has identical scheduling behaviour.
 	AllowSchedulingOnControlPlane bool `json:"allow_scheduling_on_control_plane"`
+	// WorkloadFeatures describes workload-specific Talos configuration requirements
+	// discovered during the collect phase.
+	WorkloadFeatures WorkloadFeatures `json:"workload_features"`
+}
+
+// WorkloadFeatures captures Talos machine-config requirements implied by the
+// workloads running in the source cluster.
+type WorkloadFeatures struct {
+	// HasServiceLB is true when k3s's built-in ServiceLB (klipper-lb) is
+	// active.  Klipper-lb pods use unsafe sysctls that Talos's kubelet must
+	// explicitly permit via allowedUnsafeSysctls.
+	HasServiceLB bool `json:"has_service_lb"`
+	// AllowedUnsafeSysctls is the deduplicated list of unsafe sysctls that
+	// the kubelet must whitelist so that the detected workloads can run.
+	AllowedUnsafeSysctls []string `json:"allowed_unsafe_sysctls,omitempty"`
 }
 
 // Node represents a Kubernetes node in the k3s cluster.
@@ -361,7 +376,45 @@ func (c *Collector) collectWorkloads(info *ClusterInfo) error {
 	countOut, _ := c.ssh.Run(
 		c.kubectlBin() + " get deployments,statefulsets,daemonsets --all-namespaces --no-headers 2>/dev/null | wc -l")
 	fmt.Sscanf(strings.TrimSpace(countOut), "%d", &info.WorkloadCount)
+
+	c.detectWorkloadFeatures(info)
 	return nil
+}
+
+// detectWorkloadFeatures inspects running workloads and records which Talos
+// machine-config knobs are required for them to function after migration.
+func (c *Collector) detectWorkloadFeatures(info *ClusterInfo) {
+	// k3s ServiceLB (klipper-lb): k3s creates a DaemonSet named svclb-<svc>
+	// in kube-system for every LoadBalancer service.  The pods set unsafe
+	// sysctls (net.ipv4.ip_forward, net.ipv4.conf.all.forwarding) that Talos's
+	// kubelet must whitelist via allowedUnsafeSysctls.
+	svclbOut, _ := c.ssh.RunNoSudo(
+		c.kubectlBin() + ` get daemonsets -n kube-system --no-headers 2>/dev/null | awk '{print $1}' | grep -c '^svclb-' || true`)
+	var n int
+	parsed, _ := fmt.Sscanf(strings.TrimSpace(svclbOut), "%d", &n)
+	if parsed == 1 && n > 0 {
+		info.WorkloadFeatures.HasServiceLB = true
+		info.WorkloadFeatures.AllowedUnsafeSysctls = appendUnique(
+			info.WorkloadFeatures.AllowedUnsafeSysctls,
+			"net.ipv4.ip_forward",
+			"net.ipv4.conf.all.forwarding",
+		)
+	}
+}
+
+// appendUnique appends values to dst, skipping any already present.
+func appendUnique(dst []string, vals ...string) []string {
+	seen := make(map[string]bool, len(dst))
+	for _, v := range dst {
+		seen[v] = true
+	}
+	for _, v := range vals {
+		if !seen[v] {
+			dst = append(dst, v)
+			seen[v] = true
+		}
+	}
+	return dst
 }
 
 func (c *Collector) collectPVs(info *ClusterInfo) error {
