@@ -303,6 +303,8 @@ ethernets:
     match:
       name: "en*"
     dhcp4: true
+    nameservers:
+      addresses: [8.8.8.8, 8.8.4.4]
 EOF
   else
     cat > "${ci_dir}/network-config" <<EOF
@@ -341,7 +343,7 @@ vm_start() {
   elif $USE_BRIDGE; then
     netdev_args="-netdev bridge,id=net0,br=${BRIDGE} -device virtio-net-pci,netdev=net0,mac=${mac}"
   else
-    netdev_args="-netdev user,id=net0,hostfwd=tcp::${UM_SSH_PORT}-:22,hostfwd=tcp::${UM_TALOS_PORT}-:50000,hostfwd=tcp::${UM_K8S_PORT}-:6443 -device virtio-net-pci,netdev=net0,mac=${mac}"
+    netdev_args="-netdev user,id=net0,dns=8.8.8.8,hostfwd=tcp::${UM_SSH_PORT}-:22,hostfwd=tcp::${UM_TALOS_PORT}-:50000,hostfwd=tcp::${UM_K8S_PORT}-:6443 -device virtio-net-pci,netdev=net0,mac=${mac}"
   fi
 
   log_info "Starting VM: ${name}  disk=${disk}"
