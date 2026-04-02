@@ -1,10 +1,13 @@
 package nextboot
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/briandowns/spinner"
@@ -121,11 +124,45 @@ func (i *Installer) Run(opts Options) error {
 		remoteCmd += fmt.Sprintf(" --config %s", remoteCfg)
 	}
 
-	err = i.ssh.RunStream(
-		remoteCmd,
-		newPrefixWriter("  remote> "),
-		newPrefixWriter("  remote> "),
-	)
+	// Run the agent with a reboot-aware wrapper.  The agent ends with a
+	// reboot syscall which kills the remote process instantly.  On real
+	// hardware the TCP RST propagates and RunStream returns promptly, but
+	// QEMU user-mode networking (SLiRP) keeps the forwarded TCP connection
+	// alive after the guest reboots, so RunStream hangs forever.
+	//
+	// Solution: wrap stdout in a rebootDetector that fires a channel when it
+	// sees "Rebooting into Talos" or "kexec -e".  A goroutine waits on
+	// either RunStream completing normally or the reboot signal + grace
+	// period, whichever comes first.
+	detector := &rebootDetector{
+		inner: newPrefixWriter("  remote> "),
+		done:  make(chan struct{}),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- i.ssh.RunStream(
+			remoteCmd,
+			detector,
+			newPrefixWriter("  remote> "),
+		)
+	}()
+
+	select {
+	case err = <-errCh:
+		// Normal completion or disconnect.
+	case <-detector.done:
+		// The agent printed a reboot message.  Give it a few seconds for
+		// the syscall to fire, then move on regardless.
+		select {
+		case err = <-errCh:
+		case <-time.After(10 * time.Second):
+			// RunStream is stuck (QEMU SLiRP keeps TCP alive). Close the
+			// SSH session by closing the client — this unblocks RunStream.
+			i.ssh.Close()
+			err = <-errCh
+		}
+	}
 
 	// SSH disconnect is expected — the machine reboots at the end of the agent.
 	if err != nil && !ssh.IsDisconnectError(err) {
@@ -204,4 +241,24 @@ func (pw *prefixWriter) Write(p []byte) (n int, err error) {
 		pw.buf = pw.buf[idx+1:]
 	}
 	return len(p), nil
+}
+
+// rebootDetector wraps an io.Writer and signals on its done channel when it
+// sees the nextboot agent's reboot message in the output stream.  This lets
+// the caller stop waiting for RunStream to return — on QEMU user-mode
+// networking the TCP connection stays alive after guest reboot, so the SSH
+// session never gets an EOF.
+type rebootDetector struct {
+	inner io.Writer
+	done  chan struct{}
+	once  sync.Once
+}
+
+func (d *rebootDetector) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("Rebooting into Talos")) ||
+		bytes.Contains(p, []byte("kexec -e")) ||
+		bytes.Contains(p, []byte("Talos installation complete")) {
+		d.once.Do(func() { close(d.done) })
+	}
+	return d.inner.Write(p)
 }
